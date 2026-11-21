@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -21,21 +21,98 @@ import {
   ImageShader,
   MipmapMode,
   Shader,
+  SkImage,
   Skia,
   TileMode,
   useImage,
 } from 'react-native-skia';
 import { ASTRO_PRESETS, ASTRO_SKSL_SHADER, AstroParams } from './src/astroShader';
 
+function computeAutoParams(img: SkImage): AstroParams {
+  try {
+    const sampleSize = 64;
+    const surface = Skia.Surface.MakeOffscreen(sampleSize, sampleSize);
+    if (!surface) return ASTRO_PRESETS[0].params;
+
+    const canvas = surface.getCanvas();
+    const paint = Skia.Paint();
+    canvas.drawImageRect(
+      img,
+      Skia.XYWHRect(0, 0, img.width(), img.height()),
+      Skia.XYWHRect(0, 0, sampleSize, sampleSize),
+      paint
+    );
+    surface.flush();
+
+    const snap = surface.makeImageSnapshot();
+    const pixels = snap.readPixels(0, 0);
+    if (!pixels) return ASTRO_PRESETS[0].params;
+
+    const lumas: number[] = [];
+    for (let i = 0; i < pixels.length; i += 4) {
+      const r = pixels[i] / 255;
+      const g = pixels[i + 1] / 255;
+      const b = pixels[i + 2] / 255;
+      lumas.push(0.2126 * r + 0.7152 * g + 0.0722 * b);
+    }
+
+    lumas.sort((a, b) => a - b);
+    const p10 = lumas[Math.floor(lumas.length * 0.1)] ?? 0.05;   // Background sky level
+    const p50 = lumas[Math.floor(lumas.length * 0.5)] ?? 0.15;   // Median subject brightness
+    const p95 = lumas[Math.floor(lumas.length * 0.95)] ?? 0.75;  // Highlights
+
+    // Bright planetary/lunar/solar frames have high p95 and low background or high median
+    const isBrightTarget = p50 > 0.32 || (p10 < 0.04 && p95 > 0.78);
+
+    if (isBrightTarget) {
+      // Moon, Sun, or bright planet: gentle stretch, strong crisp detail, protect highlights
+      return {
+        stretch: 0.18,
+        blackPoint: Math.min(0.08, Math.max(0.01, Number((p10 * 0.7).toFixed(2)))),
+        sharpen: 0.95,
+        denoise: 0.3,
+        vibrance: 0.3,
+        starControl: 0.35,
+      };
+    }
+
+    // Deep sky (nebula, galaxy, star cluster): adapt stretch to how dark the midtones are
+    const autoStretch = Math.min(0.75, Math.max(0.28, Number((0.72 - p50 * 1.4).toFixed(2))));
+    const autoBlack = Math.min(0.22, Math.max(0.02, Number((p10 * 0.85).toFixed(2))));
+
+    return {
+      stretch: autoStretch,
+      blackPoint: autoBlack,
+      sharpen: 0.45,
+      denoise: 0.5,
+      vibrance: 0.5,
+      starControl: 0.75,
+    };
+  } catch {
+    return ASTRO_PRESETS[0].params;
+  }
+}
+
 export default function App() {
   const { width: screenWidth } = useWindowDimensions();
   const [imageUri, setImageUri] = useState<string | null>(null);
-  const [activePresetId, setActivePresetId] = useState<string>('auto_deep_sky');
+  const [activePresetId, setActivePresetId] = useState<string>('auto_pro');
   const [params, setParams] = useState<AstroParams>(ASTRO_PRESETS[0].params);
   const [showOriginal, setShowOriginal] = useState<boolean>(false);
   const [isSaving, setIsSaving] = useState<boolean>(false);
+  const [renderTick, setRenderTick] = useState<number>(0);
 
   const skImage = useImage(imageUri);
+
+  // Run automatic histogram analysis whenever a new photo finishes loading
+  useEffect(() => {
+    if (skImage) {
+      const auto = computeAutoParams(skImage);
+      setActivePresetId('auto_pro');
+      setParams(auto);
+      setRenderTick((t) => t + 1);
+    }
+  }, [skImage]);
 
   const runtimeEffect = useMemo(() => {
     const effect = Skia.RuntimeEffect.Make(ASTRO_SKSL_SHADER);
@@ -75,18 +152,26 @@ export default function App() {
 
     if (!result.canceled && result.assets[0]) {
       setImageUri(result.assets[0].uri);
-      setActivePresetId('auto_deep_sky');
-      setParams(ASTRO_PRESETS[0].params);
     }
   };
 
-  const applyPreset = (presetId: string) => {
-    const found = ASTRO_PRESETS.find((p) => p.id === presetId);
-    if (found) {
-      setActivePresetId(found.id);
-      setParams({ ...found.params });
-    }
-  };
+  const applyPreset = useCallback(
+    (presetId: string) => {
+      if (presetId === 'auto_pro' && skImage) {
+        setActivePresetId('auto_pro');
+        setParams(computeAutoParams(skImage));
+        setRenderTick((t) => t + 1);
+        return;
+      }
+      const found = ASTRO_PRESETS.find((p) => p.id === presetId);
+      if (found) {
+        setActivePresetId(found.id);
+        setParams({ ...found.params });
+        setRenderTick((t) => t + 1);
+      }
+    },
+    [skImage]
+  );
 
   const adjustParam = (key: keyof AstroParams, delta: number, min: number, max: number) => {
     setActivePresetId('custom');
@@ -94,6 +179,7 @@ export default function App() {
       ...prev,
       [key]: Math.min(max, Math.max(min, Number((prev[key] + delta).toFixed(2)))),
     }));
+    setRenderTick((t) => t + 1);
   };
 
   const exportFullResolution = async () => {
@@ -128,8 +214,6 @@ export default function App() {
         MipmapMode.None
       );
 
-      // Uniforms in exact order declared in ASTRO_SKSL_SHADER:
-      // float2 resolution, float stretch, float blackPoint, float sharpen, float denoise, float vibrance, float skyNeutral
       step = 'makeRuntimeShader';
       const uniformValues = [
         fullW,
@@ -139,7 +223,7 @@ export default function App() {
         params.sharpen,
         params.denoise,
         params.vibrance,
-        params.skyNeutral,
+        params.starControl,
       ];
 
       const finalShader = runtimeEffect.makeShaderWithChildren(uniformValues, [imgShader]);
@@ -175,18 +259,15 @@ export default function App() {
 
   const activeParams = showOriginal ? ASTRO_PRESETS[4].params : params;
 
-  const uniforms = useMemo(
-    () => ({
-      resolution: [canvasDimensions.width, canvasDimensions.height],
-      stretch: activeParams.stretch,
-      blackPoint: activeParams.blackPoint,
-      sharpen: activeParams.sharpen,
-      denoise: activeParams.denoise,
-      vibrance: activeParams.vibrance,
-      skyNeutral: activeParams.skyNeutral,
-    }),
-    [canvasDimensions, activeParams]
-  );
+  const uniforms = {
+    resolution: [canvasDimensions.width, canvasDimensions.height],
+    stretch: activeParams.stretch,
+    blackPoint: activeParams.blackPoint,
+    sharpen: activeParams.sharpen,
+    denoise: activeParams.denoise,
+    vibrance: activeParams.vibrance,
+    starControl: activeParams.starControl,
+  };
 
   return (
     <SafeAreaView style={styles.container}>
@@ -196,7 +277,7 @@ export default function App() {
         <View style={styles.header}>
           <View>
             <Text style={styles.title}>AstroEnhancer</Text>
-            <Text style={styles.subtitle}>Deep-Sky & Planetary GPU Processor</Text>
+            <Text style={styles.subtitle}>Natural Deep-Sky, Lunar & Planetary Processor</Text>
           </View>
           <Pressable style={styles.primaryBtn} onPress={pickImage}>
             <Text style={styles.primaryBtnText}>{imageUri ? 'Change Photo' : 'Open Photo'}</Text>
@@ -211,7 +292,10 @@ export default function App() {
               onPressOut={() => setShowOriginal(false)}
               style={{ width: canvasDimensions.width, height: canvasDimensions.height }}
             >
-              <Canvas style={{ width: canvasDimensions.width, height: canvasDimensions.height }}>
+              <Canvas
+                key={`canvas-${renderTick}-${showOriginal ? 'orig' : 'edit'}`}
+                style={{ width: canvasDimensions.width, height: canvasDimensions.height }}
+              >
                 <Fill>
                   <Shader source={runtimeEffect} uniforms={uniforms}>
                     <ImageShader
@@ -237,7 +321,7 @@ export default function App() {
             <Pressable style={styles.emptyState} onPress={pickImage}>
               <Text style={styles.emptyTitle}>Tap to Load Astrophoto</Text>
               <Text style={styles.emptyDesc}>
-                Supports Nebulas, Galaxies, Moon, Planets & Star Clusters (JPEG/PNG/TIFF)
+                Automatically balances Nebulas, Galaxies, Moon, Sun & Planets
               </Text>
             </Pressable>
           )}
@@ -246,7 +330,7 @@ export default function App() {
         {/* Target Presets */}
         {skImage && (
           <>
-            <Text style={styles.sectionTitle}>Auto Enhancement Profiles</Text>
+            <Text style={styles.sectionTitle}>Enhancement Profiles</Text>
             <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.presetRow}>
               {ASTRO_PRESETS.map((preset) => {
                 const isSelected = activePresetId === preset.id;
@@ -269,31 +353,31 @@ export default function App() {
             <Text style={styles.sectionTitle}>Fine-Tune Pipeline</Text>
             <View style={styles.controlsCard}>
               <ControlRow
-                label="Asinh Stretch (Faint Detail)"
+                label="Detail Stretch (Faint Gas & Dust)"
                 value={params.stretch}
                 onDec={() => adjustParam('stretch', -0.05, 0, 1)}
                 onInc={() => adjustParam('stretch', 0.05, 0, 1)}
               />
               <ControlRow
-                label="Skyglow Neutralizer"
-                value={params.skyNeutral}
-                onDec={() => adjustParam('skyNeutral', -0.05, 0, 1)}
-                onInc={() => adjustParam('skyNeutral', 0.05, 0, 1)}
-              />
-              <ControlRow
-                label="Black Point Floor"
+                label="Sky Background Floor"
                 value={params.blackPoint}
-                onDec={() => adjustParam('blackPoint', -0.02, 0, 0.35)}
-                onInc={() => adjustParam('blackPoint', 0.02, 0, 0.35)}
+                onDec={() => adjustParam('blackPoint', -0.02, 0, 0.4)}
+                onInc={() => adjustParam('blackPoint', 0.02, 0, 0.4)}
               />
               <ControlRow
-                label="Deconvolution Sharpen"
+                label="Star Control & White Cores"
+                value={params.starControl}
+                onDec={() => adjustParam('starControl', -0.1, 0, 1)}
+                onInc={() => adjustParam('starControl', 0.1, 0, 1)}
+              />
+              <ControlRow
+                label="Structure & Crater Sharpen"
                 value={params.sharpen}
                 onDec={() => adjustParam('sharpen', -0.1, 0, 1.5)}
                 onInc={() => adjustParam('sharpen', 0.1, 0, 1.5)}
               />
               <ControlRow
-                label="Astro Vibrance"
+                label="Natural Midtone Color"
                 value={params.vibrance}
                 onDec={() => adjustParam('vibrance', -0.1, 0, 1.5)}
                 onInc={() => adjustParam('vibrance', 0.1, 0, 1.5)}
@@ -301,8 +385,8 @@ export default function App() {
               <ControlRow
                 label="Background Denoise"
                 value={params.denoise}
-                onDec={() => adjustParam('denoise', -0.05, 0, 1)}
-                onInc={() => adjustParam('denoise', 0.05, 0, 1)}
+                onDec={() => adjustParam('denoise', -0.1, 0, 1)}
+                onInc={() => adjustParam('denoise', 0.1, 0, 1)}
               />
             </View>
 
