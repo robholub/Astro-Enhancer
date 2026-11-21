@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -13,13 +13,16 @@ import {
 import { StatusBar } from 'expo-status-bar';
 import * as ImagePicker from 'expo-image-picker';
 import * as MediaLibrary from 'expo-media-library';
-import * as FileSystem from 'expo-file-system';
+import * as FileSystem from 'expo-file-system/legacy';
 import {
   Canvas,
   Fill,
+  FilterMode,
   ImageShader,
+  MipmapMode,
   Shader,
   Skia,
+  TileMode,
   useImage,
 } from 'react-native-skia';
 import { ASTRO_PRESETS, ASTRO_SKSL_SHADER, AstroParams } from './src/astroShader';
@@ -72,7 +75,6 @@ export default function App() {
 
     if (!result.canceled && result.assets[0]) {
       setImageUri(result.assets[0].uri);
-      // Automatically apply Auto Deep Sky enhancement upon load
       setActivePresetId('auto_deep_sky');
       setParams(ASTRO_PRESETS[0].params);
     }
@@ -99,7 +101,7 @@ export default function App() {
 
     try {
       setIsSaving(true);
-      const { status } = await MediaLibrary.requestPermissionsAsync();
+      const { status } = await MediaLibrary.requestPermissionsAsync(true);
       if (status !== 'granted') {
         Alert.alert('Permission Required', 'Allow photo library access to save your enhanced image.');
         setIsSaving(false);
@@ -109,7 +111,6 @@ export default function App() {
       const fullW = skImage.width();
       const fullH = skImage.height();
 
-      // Render offscreen at full native sensor resolution
       const surface = Skia.Surface.MakeOffscreen(fullW, fullH);
       if (!surface) {
         throw new Error('Could not allocate offscreen GPU surface');
@@ -119,10 +120,10 @@ export default function App() {
       const paint = Skia.Paint();
 
       const imgShader = skImage.makeShaderOptions(
-        0, // Clamp TileMode
-        0,
-        1, // Linear FilterMode
-        0  // None MipmapMode
+        TileMode.Clamp,
+        TileMode.Clamp,
+        FilterMode.Linear,
+        MipmapMode.None
       );
 
       const builder = Skia.RuntimeShaderBuilder(runtimeEffect);
@@ -142,6 +143,11 @@ export default function App() {
 
       const snapshot = surface.makeImageSnapshot();
       const base64 = snapshot.encodeToBase64();
+
+      if (!FileSystem.cacheDirectory) {
+        throw new Error('Cache directory unavailable');
+      }
+
       const fileUri = `${FileSystem.cacheDirectory}astro_enhanced_${Date.now()}.png`;
 
       await FileSystem.writeAsStringAsync(fileUri, base64, {
