@@ -99,8 +99,11 @@ export default function App() {
   const exportFullResolution = async () => {
     if (!skImage || !runtimeEffect) return;
 
+    let step = 'init';
     try {
       setIsSaving(true);
+
+      step = 'requestPermissions';
       const { status } = await MediaLibrary.requestPermissionsAsync(true);
       if (status !== 'granted') {
         Alert.alert('Permission Required', 'Allow photo library access to save your enhanced image.');
@@ -111,14 +114,13 @@ export default function App() {
       const fullW = skImage.width();
       const fullH = skImage.height();
 
+      step = 'makeOffscreenSurface';
       const surface = Skia.Surface.MakeOffscreen(fullW, fullH);
       if (!surface) {
         throw new Error('Could not allocate offscreen GPU surface');
       }
 
-      const canvas = surface.getCanvas();
-      const paint = Skia.Paint();
-
+      step = 'makeImageShader';
       const imgShader = skImage.makeShaderOptions(
         TileMode.Clamp,
         TileMode.Clamp,
@@ -126,21 +128,31 @@ export default function App() {
         MipmapMode.None
       );
 
-      const builder = Skia.RuntimeShaderBuilder(runtimeEffect);
-      builder.setUniform('resolution', [fullW, fullH]);
-      builder.setUniform('stretch', [params.stretch]);
-      builder.setUniform('blackPoint', [params.blackPoint]);
-      builder.setUniform('sharpen', [params.sharpen]);
-      builder.setUniform('denoise', [params.denoise]);
-      builder.setUniform('vibrance', [params.vibrance]);
-      builder.setUniform('skyNeutral', [params.skyNeutral]);
+      // Uniforms in exact order declared in ASTRO_SKSL_SHADER:
+      // float2 resolution, float stretch, float blackPoint, float sharpen, float denoise, float vibrance, float skyNeutral
+      step = 'makeRuntimeShader';
+      const uniformValues = [
+        fullW,
+        fullH,
+        params.stretch,
+        params.blackPoint,
+        params.sharpen,
+        params.denoise,
+        params.vibrance,
+        params.skyNeutral,
+      ];
 
-      const finalShader = builder.makeShaderWithChildren([imgShader]);
+      const finalShader = runtimeEffect.makeShaderWithChildren(uniformValues, [imgShader]);
+
+      step = 'drawToCanvas';
+      const canvas = surface.getCanvas();
+      const paint = Skia.Paint();
       paint.setShader(finalShader);
 
       canvas.drawRect(Skia.XYWHRect(0, 0, fullW, fullH), paint);
       surface.flush();
 
+      step = 'encodeSnapshot';
       const snapshot = surface.makeImageSnapshot();
       const base64 = snapshot.encodeToBase64();
 
@@ -148,16 +160,20 @@ export default function App() {
         throw new Error('Cache directory unavailable');
       }
 
+      step = 'writeFile';
       const fileUri = `${FileSystem.cacheDirectory}astro_enhanced_${Date.now()}.png`;
-
       await FileSystem.writeAsStringAsync(fileUri, base64, {
-        encoding: FileSystem.EncodingType.Base64,
+        encoding: 'base64',
       });
 
+      step = 'saveToLibrary';
       await MediaLibrary.saveToLibraryAsync(fileUri);
       Alert.alert('Saved', `Full-resolution (${fullW}x${fullH}) astrophoto saved to your gallery.`);
     } catch (err) {
-      Alert.alert('Export Error', err instanceof Error ? err.message : 'Failed to save image.');
+      Alert.alert(
+        'Export Error',
+        `Failed at [${step}]: ${err instanceof Error ? err.message : String(err)}`
+      );
     } finally {
       setIsSaving(false);
     }
