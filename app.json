@@ -5,10 +5,21 @@
     "version": "1.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
-"extra": { "eas": { "projectId": "67f10a15-9613-40a5-84fc-b4c7f66549c6" } },
+    "icon": "./assets/icon.png",
+    "splash": {
+      "image": "./assets/icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#070A12"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "67f10a15-9613-40a5-84fc-b4c7f66549c6"
+      }
+    },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.robholub.astroenhancer",
+      "bundleIdentifier": "com.astroenhancer.app",
+      "buildNumber": "1",
       "deploymentTarget": "15.1",
       "infoPlist": {
         "NSPhotoLibraryUsageDescription": "Select astrophotography images from your library for processing.",
@@ -17,7 +28,12 @@
     },
     "android": {
       "package": "com.robholub.astroenhancer",
+      "versionCode": 1,
       "minSdkVersion": 26,
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/icon.png",
+        "backgroundColor": "#070A12"
+      },
       "permissions": [
         "READ_MEDIA_IMAGES",
         "WRITE_EXTERNAL_STORAGE"
@@ -41,3 +57,4 @@
     ]
   }
 }
+
