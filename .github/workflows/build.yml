@@ -25,6 +25,20 @@ jobs:
           eas-version: latest
           token: ${{ secrets.EXPO_TOKEN }}
 
+      - name: Generate App Icon
+        run: |
+          mkdir -p assets
+          convert -size 1024x1024 radial-gradient:"#1E3A8A"-"#070A12" \
+            -fill "rgba(56,189,248,0.28)" -draw "circle 512,512 512,210" \
+            -fill "rgba(168,85,247,0.22)" -draw "circle 540,480 540,270" \
+            -fill "#F8FAFC" \
+            -draw "polygon 512,260 548,476 764,512 548,548 512,764 476,548 260,512 476,476" \
+            -fill "#38BDF8" \
+            -draw "circle 690,330 690,312" \
+            -draw "circle 340,670 340,656" \
+            -draw "circle 720,660 720,648" \
+            assets/icon.png
+
       - name: Install dependencies
         run: npm install --legacy-peer-deps && npx expo install --fix
 
