@@ -13,7 +13,7 @@ import {
 import { StatusBar } from 'expo-status-bar';
 import * as ImagePicker from 'expo-image-picker';
 import * as MediaLibrary from 'expo-media-library';
-import * as FileSystem from 'expo-file-system/legacy';
+import { File, Paths } from 'expo-file-system';
 import {
   Canvas,
   Fill,
@@ -154,20 +154,14 @@ export default function App() {
 
       step = 'encodeSnapshot';
       const snapshot = surface.makeImageSnapshot();
-      const base64 = snapshot.encodeToBase64();
-
-      if (!FileSystem.cacheDirectory) {
-        throw new Error('Cache directory unavailable');
-      }
+      const pngBytes = await Promise.resolve(snapshot.encodeToBytes());
 
       step = 'writeFile';
-      const fileUri = `${FileSystem.cacheDirectory}astro_enhanced_${Date.now()}.png`;
-      await FileSystem.writeAsStringAsync(fileUri, base64, {
-        encoding: 'base64',
-      });
+      const outFile = new File(Paths.cache, `astro_enhanced_${Date.now()}.png`);
+      outFile.write(pngBytes);
 
       step = 'saveToLibrary';
-      await MediaLibrary.saveToLibraryAsync(fileUri);
+      await MediaLibrary.saveToLibraryAsync(outFile.uri);
       Alert.alert('Saved', `Full-resolution (${fullW}x${fullH}) astrophoto saved to your gallery.`);
     } catch (err) {
       Alert.alert(
