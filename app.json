@@ -5,6 +5,7 @@
     "version": "1.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
+"extra": { "eas": { "projectId": "67f10a15-9613-40a5-84fc-b4c7f66549c6" } },
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.astroenhancer.app",
