@@ -16,7 +16,7 @@
       }
     },
     "android": {
-      "package": "com.astroenhancer.app",
+      "package": "com.robholub.astroenhancer",
       "minSdkVersion": 26,
       "permissions": [
         "READ_MEDIA_IMAGES",
