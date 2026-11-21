@@ -6,65 +6,65 @@ export interface AstroPreset {
 }
 
 export interface AstroParams {
-  stretch: number;      // 0.0 to 1.0 (Asinh midtone stretch for faint nebulosity)
-  blackPoint: number;   // 0.0 to 0.35 (Clips light pollution floor)
-  sharpen: number;      // 0.0 to 1.5 (Unsharp mask for lunar/planetary detail)
-  denoise: number;      // 0.0 to 1.0 (Chroma/background noise suppression)
-  vibrance: number;     // 0.0 to 1.5 (Emission nebula & star color boost)
-  skyNeutral: number;   // 0.0 to 1.0 (Neutralizes orange/green light pollution)
+  stretch: number;      // 0.0 to 1.0 (Midtone / Asinh stretch)
+  blackPoint: number;   // 0.0 to 0.40 (Sky background floor)
+  sharpen: number;      // 0.0 to 1.5 (Structure & surface detail)
+  denoise: number;      // 0.0 to 1.0 (Background grain smoothing)
+  vibrance: number;     // 0.0 to 1.5 (Natural midtone color)
+  starControl: number;  // 0.0 to 1.0 (Star bloat reduction & white-core recovery)
 }
 
 export const ASTRO_PRESETS: AstroPreset[] = [
   {
-    id: 'auto_deep_sky',
-    name: 'Auto Deep Sky',
-    description: 'Balanced stretch & skyglow removal for nebulas & galaxies',
+    id: 'auto_pro',
+    name: 'Auto Pro',
+    description: 'Analyzes your photo brightness & sets natural balanced levels',
     params: {
-      stretch: 0.62,
-      blackPoint: 0.08,
-      sharpen: 0.35,
+      stretch: 0.45,
+      blackPoint: 0.06,
+      sharpen: 0.45,
       denoise: 0.45,
-      vibrance: 0.65,
-      skyNeutral: 0.75,
+      vibrance: 0.45,
+      starControl: 0.65,
     },
   },
   {
-    id: 'nebula_boost',
-    name: 'Nebula (H-Alpha)',
-    description: 'Aggressive faint-detail stretch & emission color separation',
+    id: 'deep_sky_natural',
+    name: 'Nebula & Galaxy',
+    description: 'Reveals faint dust & gas while keeping pinpoint natural stars',
     params: {
-      stretch: 0.78,
-      blackPoint: 0.11,
+      stretch: 0.65,
+      blackPoint: 0.08,
       sharpen: 0.4,
       denoise: 0.55,
-      vibrance: 0.95,
-      skyNeutral: 0.85,
+      vibrance: 0.55,
+      starControl: 0.75,
     },
   },
   {
-    id: 'planetary_lunar',
-    name: 'Moon & Planets',
-    description: 'High micro-contrast & crater/band sharpening without over-stretching',
+    id: 'lunar_solar',
+    name: 'Moon & Sun',
+    description: 'Crisp craters, maria & solar granulation with controlled highlights',
     params: {
-      stretch: 0.18,
-      blackPoint: 0.04,
-      sharpen: 1.15,
-      denoise: 0.25,
-      vibrance: 0.35,
-      skyNeutral: 0.2,
+      stretch: 0.2,
+      blackPoint: 0.03,
+      sharpen: 1.05,
+      denoise: 0.3,
+      vibrance: 0.25,
+      starControl: 0.3,
     },
   },
   {
-    id: 'galaxy_core',
-    name: 'Galaxy HDR',
-    description: 'Reveals outer dust lanes while protecting bright galactic cores',
+    id: 'planetary',
+    name: 'Planets',
+    description: 'Enhances cloud bands, rings & surface contrast without ringing',
     params: {
-      stretch: 0.55,
-      blackPoint: 0.09,
-      sharpen: 0.55,
+      stretch: 0.25,
+      blackPoint: 0.05,
+      sharpen: 1.2,
       denoise: 0.4,
-      vibrance: 0.5,
-      skyNeutral: 0.8,
+      vibrance: 0.4,
+      starControl: 0.2,
     },
   },
   {
@@ -77,12 +77,12 @@ export const ASTRO_PRESETS: AstroPreset[] = [
       sharpen: 0.0,
       denoise: 0.0,
       vibrance: 0.0,
-      skyNeutral: 0.0,
+      starControl: 0.0,
     },
   },
 ];
 
-// GPU Runtime Shader (SkSL)
+// GPU Runtime Shader (SkSL) - Natural Astrophotography Pipeline
 export const ASTRO_SKSL_SHADER = `
 uniform shader image;
 uniform float2 resolution;
@@ -91,16 +91,16 @@ uniform float blackPoint;
 uniform float sharpen;
 uniform float denoise;
 uniform float vibrance;
-uniform float skyNeutral;
+uniform float starControl;
 
-float getLuma(half3 c) {
-  return dot(float3(c), float3(0.2126, 0.7152, 0.0722));
+float getLuma(float3 c) {
+  return dot(c, float3(0.2126, 0.7152, 0.0722));
 }
 
-// Inverse hyperbolic sine stretch (standard in astrophotography to preserve star cores)
-float asinhStretch(float x, float beta) {
-  if (beta <= 0.001) return x;
-  float b = beta * 12.0;
+// Luminance-preserving inverse hyperbolic sine stretch (prevents star color shifts)
+float asinhCurve(float x, float amount) {
+  if (amount <= 0.001) return x;
+  float b = amount * 10.0;
   return log(b * x + sqrt(b * b * x * x + 1.0)) / log(b + sqrt(b * b + 1.0));
 }
 
@@ -108,7 +108,7 @@ half4 main(float2 xy) {
   half4 center = image.eval(xy);
   float3 rgb = float3(center.rgb);
 
-  // Sample 3x3 neighborhood for sharpening & background denoising
+  // Sample 3x3 neighborhood
   float3 n  = float3(image.eval(xy + float2( 0.0, -1.0)).rgb);
   float3 s  = float3(image.eval(xy + float2( 0.0,  1.0)).rgb);
   float3 e  = float3(image.eval(xy + float2( 1.0,  0.0)).rgb);
@@ -119,47 +119,70 @@ half4 main(float2 xy) {
   float3 se = float3(image.eval(xy + float2( 1.0,  1.0)).rgb);
 
   float3 blur = (n + s + e + w) * 0.15 + (nw + ne + sw + se) * 0.10;
-  float luma = getLuma(half3(rgb));
+  float luma = getLuma(rgb);
+  float blurLuma = getLuma(blur);
 
-  // 1. Shadow-targeted denoising (smooths noisy sky background, preserves bright stars)
-  float shadowMask = 1.0 - smoothstep(0.05, 0.35, luma);
-  rgb = mix(rgb, blur, denoise * shadowMask * 0.75);
+  // Detect pinpoint star spikes (local peak much brighter than surrounding neighborhood)
+  float localPeak = max(0.0, luma - blurLuma);
+  float starMask = clamp(smoothstep(0.06, 0.28, localPeak) + smoothstep(0.75, 0.96, luma), 0.0, 1.0);
 
-  // 2. Unsharp mask for lunar craters, planetary bands, and nebula filaments
-  float3 detail = rgb - blur;
-  float detailMask = smoothstep(0.03, 0.25, luma);
-  rgb += detail * sharpen * detailMask * 1.4;
-
-  // 3. Light pollution neutralization (balances low-luminance color cast toward neutral dark sky)
-  if (skyNeutral > 0.001) {
-    float bgWeight = (1.0 - smoothstep(0.04, 0.28, luma)) * skyNeutral;
-    float meanChannel = (rgb.r + rgb.g + rgb.b) / 3.0;
-    rgb = mix(rgb, float3(meanChannel * 0.92), bgWeight * 0.65);
+  // 1. Morphological Star Tightening (reduces star bloat & halo diameter)
+  if (starControl > 0.001) {
+    float3 minNeighbor = min(min(min(n, s), min(e, w)), min(min(nw, ne), min(sw, se)));
+    float haloZone = smoothstep(0.03, 0.18, localPeak) * (1.0 - smoothstep(0.25, 0.55, localPeak));
+    rgb = mix(rgb, min(rgb, mix(blur, minNeighbor, 0.45)), starControl * haloZone * 0.65);
   }
 
-  // 4. Black point clipping (sets true dark space floor)
-  rgb = max(rgb - float3(blackPoint), float3(0.0)) / max(1.0 - blackPoint, 0.01);
+  // 2. Edge-aware Background Denoising (clearly visible on noisy sky backgrounds)
+  if (denoise > 0.001) {
+    float edgeDiff = length(rgb - blur);
+    float flatMask = 1.0 - smoothstep(0.02, 0.18, edgeDiff);
+    rgb = mix(rgb, blur, denoise * flatMask * 0.85);
+  }
 
-  // 5. Asinh non-linear histogram stretch
-  float stretchedLuma = asinhStretch(getLuma(half3(rgb)), stretch);
-  float origLuma = max(getLuma(half3(rgb)), 0.0001);
-  float ratio = stretchedLuma / origLuma;
-  // Blend luminance-preserving stretch with per-channel stretch to avoid washed-out highlights
-  float3 lumPreserved = rgb * ratio;
-  float3 perChannel = float3(
-    asinhStretch(rgb.r, stretch),
-    asinhStretch(rgb.g, stretch),
-    asinhStretch(rgb.b, stretch)
-  );
-  rgb = mix(lumPreserved, perChannel, 0.35);
+  // 3. Structure Sharpening (applied to nebula filaments, lunar craters & planets, masked off stars)
+  if (sharpen > 0.001) {
+    float3 detail = rgb - blur;
+    float nonStarMask = (1.0 - starMask) * smoothstep(0.02, 0.15, luma);
+    rgb += detail * sharpen * nonStarMask * 1.6;
+  }
 
-  // 6. Astro Vibrance (boosts muted nebula/star colors without clipping bright cores)
-  float finalLuma = getLuma(half3(rgb));
-  float maxC = max(rgb.r, max(rgb.g, rgb.b));
-  float minC = min(rgb.r, min(rgb.g, rgb.b));
-  float sat = maxC - minC;
-  float vibranceGain = vibrance * (1.0 - sat) * smoothstep(0.03, 0.2, finalLuma);
-  rgb = mix(float3(finalLuma), rgb, 1.0 + vibranceGain);
+  // 4. Black Point & Sky Neutralization (subtracts light pollution floor cleanly)
+  if (blackPoint > 0.001) {
+    float bgLum = min(rgb.r, min(rgb.g, rgb.b));
+    float neutralFloor = blackPoint * 0.85;
+    rgb = max(rgb - float3(neutralFloor), float3(0.0)) / max(1.0 - neutralFloor, 0.05);
+  }
+
+  // 5. Pure Luminance-Preserving Asinh Stretch (never shifts RGB ratios into orange/blue)
+  if (stretch > 0.001) {
+    float curLuma = getLuma(rgb);
+    if (curLuma > 0.0001) {
+      float targetLuma = asinhCurve(curLuma, stretch);
+      // Protect highlights from clipping
+      targetLuma = mix(targetLuma, curLuma, smoothstep(0.65, 0.98, curLuma) * 0.6);
+      rgb *= (targetLuma / curLuma);
+    }
+  }
+
+  // 6. Midtone-Only Vibrance (enhances faint nebula/planetary colors, zero boost on stars)
+  float postLuma = getLuma(rgb);
+  if (vibrance > 0.001) {
+    float maxC = max(rgb.r, max(rgb.g, rgb.b));
+    float minC = min(rgb.r, min(rgb.g, rgb.b));
+    float sat = maxC - minC;
+    // Bell-curve mask: strongest in midtones (0.12 - 0.60), zero in shadows and bright stars
+    float midtoneMask = smoothstep(0.04, 0.22, postLuma) * (1.0 - smoothstep(0.50, 0.78, postLuma)) * (1.0 - starMask);
+    float gain = vibrance * (1.0 - sat) * midtoneMask * 1.1;
+    rgb = mix(float3(postLuma), rgb, 1.0 + gain);
+  }
+
+  // 7. Natural White Star Core Recovery (desaturates bright star cores & chromatic fringes)
+  float finalLuma = getLuma(rgb);
+  float coreWhiteMask = smoothstep(0.62, 0.92, finalLuma) * mix(0.45, 1.0, starControl);
+  // Also tame chromatic aberration halos on medium-bright stars
+  float starColorTame = starMask * starControl * 0.55;
+  rgb = mix(rgb, float3(finalLuma), clamp(coreWhiteMask + starColorTame, 0.0, 0.95));
 
   return half4(clamp(rgb, 0.0, 1.0), center.a);
 }
