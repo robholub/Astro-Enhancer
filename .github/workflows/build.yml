@@ -1,4 +1,4 @@
-name: Build Android and iOS Apps
+name: Build Android App
 
 on:
   push:
@@ -30,27 +30,3 @@ jobs:
 
       - name: Trigger EAS Android Build
         run: eas build --platform android --profile preview --no-wait
-
-  build_ios:
-    name: Build iOS App
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v5
-        with:
-          node-version: 22
-
-      - name: Setup Expo & EAS CLI
-        uses: expo/expo-github-action@v8
-        with:
-          eas-version: latest
-          token: ${{ secrets.EXPO_TOKEN }}
-
-      - name: Install dependencies
-        run: npm install --legacy-peer-deps && npx expo install --fix
-
-      - name: Trigger EAS iOS Build
-        run: eas build --platform ios --profile preview --no-wait
