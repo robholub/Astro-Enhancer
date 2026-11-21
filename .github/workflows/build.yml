@@ -28,7 +28,6 @@ jobs:
       - name: Install dependencies
         run: npm install --legacy-peer-deps && npx expo install --fix
 
-
       - name: Trigger EAS Android Build
         run: eas build --platform android --profile preview --no-wait
 
@@ -50,9 +49,8 @@ jobs:
           eas-version: latest
           token: ${{ secrets.EXPO_TOKEN }}
 
-       - name: Install dependencies
+      - name: Install dependencies
         run: npm install --legacy-peer-deps && npx expo install --fix
-
 
       - name: Trigger EAS iOS Build
         run: eas build --platform ios --profile preview --no-wait
