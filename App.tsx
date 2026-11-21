@@ -1,0 +1,514 @@
+import React, { useMemo, useRef, useState } from 'react';
+import {
+  ActivityIndicator,
+  Alert,
+  Pressable,
+  SafeAreaView,
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+  useWindowDimensions,
+} from 'react-native';
+import { StatusBar } from 'expo-status-bar';
+import * as ImagePicker from 'expo-image-picker';
+import * as MediaLibrary from 'expo-media-library';
+import * as FileSystem from 'expo-file-system';
+import {
+  Canvas,
+  Fill,
+  ImageShader,
+  Shader,
+  Skia,
+  useImage,
+} from 'react-native-skia';
+import { ASTRO_PRESETS, ASTRO_SKSL_SHADER, AstroParams } from './src/astroShader';
+
+export default function App() {
+  const { width: screenWidth } = useWindowDimensions();
+  const [imageUri, setImageUri] = useState<string | null>(null);
+  const [activePresetId, setActivePresetId] = useState<string>('auto_deep_sky');
+  const [params, setParams] = useState<AstroParams>(ASTRO_PRESETS[0].params);
+  const [showOriginal, setShowOriginal] = useState<boolean>(false);
+  const [isSaving, setIsSaving] = useState<boolean>(false);
+
+  const skImage = useImage(imageUri);
+
+  const runtimeEffect = useMemo(() => {
+    const effect = Skia.RuntimeEffect.Make(ASTRO_SKSL_SHADER);
+    if (!effect) {
+      console.error('Failed to compile Astro SkSL shader');
+    }
+    return effect;
+  }, []);
+
+  const canvasDimensions = useMemo(() => {
+    const maxWidth = screenWidth - 32;
+    const maxHeight = 420;
+    if (!skImage) {
+      return { width: maxWidth, height: 320 };
+    }
+    const imgW = skImage.width();
+    const imgH = skImage.height();
+    const scale = Math.min(maxWidth / imgW, maxHeight / imgH);
+    return {
+      width: Math.round(imgW * scale),
+      height: Math.round(imgH * scale),
+    };
+  }, [skImage, screenWidth]);
+
+  const pickImage = async () => {
+    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!permission.granted) {
+      Alert.alert('Permission Required', 'Please grant photo library access to load astrophotos.');
+      return;
+    }
+
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ['images'],
+      allowsEditing: false,
+      quality: 1,
+    });
+
+    if (!result.canceled && result.assets[0]) {
+      setImageUri(result.assets[0].uri);
+      // Automatically apply Auto Deep Sky enhancement upon load
+      setActivePresetId('auto_deep_sky');
+      setParams(ASTRO_PRESETS[0].params);
+    }
+  };
+
+  const applyPreset = (presetId: string) => {
+    const found = ASTRO_PRESETS.find((p) => p.id === presetId);
+    if (found) {
+      setActivePresetId(found.id);
+      setParams({ ...found.params });
+    }
+  };
+
+  const adjustParam = (key: keyof AstroParams, delta: number, min: number, max: number) => {
+    setActivePresetId('custom');
+    setParams((prev) => ({
+      ...prev,
+      [key]: Math.min(max, Math.max(min, Number((prev[key] + delta).toFixed(2)))),
+    }));
+  };
+
+  const exportFullResolution = async () => {
+    if (!skImage || !runtimeEffect) return;
+
+    try {
+      setIsSaving(true);
+      const { status } = await MediaLibrary.requestPermissionsAsync();
+      if (status !== 'granted') {
+        Alert.alert('Permission Required', 'Allow photo library access to save your enhanced image.');
+        setIsSaving(false);
+        return;
+      }
+
+      const fullW = skImage.width();
+      const fullH = skImage.height();
+
+      // Render offscreen at full native sensor resolution
+      const surface = Skia.Surface.MakeOffscreen(fullW, fullH);
+      if (!surface) {
+        throw new Error('Could not allocate offscreen GPU surface');
+      }
+
+      const canvas = surface.getCanvas();
+      const paint = Skia.Paint();
+
+      const imgShader = skImage.makeShaderOptions(
+        0, // Clamp TileMode
+        0,
+        1, // Linear FilterMode
+        0  // None MipmapMode
+      );
+
+      const builder = Skia.RuntimeShaderBuilder(runtimeEffect);
+      builder.setUniform('resolution', [fullW, fullH]);
+      builder.setUniform('stretch', [params.stretch]);
+      builder.setUniform('blackPoint', [params.blackPoint]);
+      builder.setUniform('sharpen', [params.sharpen]);
+      builder.setUniform('denoise', [params.denoise]);
+      builder.setUniform('vibrance', [params.vibrance]);
+      builder.setUniform('skyNeutral', [params.skyNeutral]);
+
+      const finalShader = builder.makeShaderWithChildren([imgShader]);
+      paint.setShader(finalShader);
+
+      canvas.drawRect(Skia.XYWHRect(0, 0, fullW, fullH), paint);
+      surface.flush();
+
+      const snapshot = surface.makeImageSnapshot();
+      const base64 = snapshot.encodeToBase64();
+      const fileUri = `${FileSystem.cacheDirectory}astro_enhanced_${Date.now()}.png`;
+
+      await FileSystem.writeAsStringAsync(fileUri, base64, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+
+      await MediaLibrary.saveToLibraryAsync(fileUri);
+      Alert.alert('Saved', `Full-resolution (${fullW}x${fullH}) astrophoto saved to your gallery.`);
+    } catch (err) {
+      Alert.alert('Export Error', err instanceof Error ? err.message : 'Failed to save image.');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const activeParams = showOriginal ? ASTRO_PRESETS[4].params : params;
+
+  const uniforms = useMemo(
+    () => ({
+      resolution: [canvasDimensions.width, canvasDimensions.height],
+      stretch: activeParams.stretch,
+      blackPoint: activeParams.blackPoint,
+      sharpen: activeParams.sharpen,
+      denoise: activeParams.denoise,
+      vibrance: activeParams.vibrance,
+      skyNeutral: activeParams.skyNeutral,
+    }),
+    [canvasDimensions, activeParams]
+  );
+
+  return (
+    <SafeAreaView style={styles.container}>
+      <StatusBar style="light" />
+      <ScrollView contentContainerStyle={styles.scrollContent}>
+        {/* Header */}
+        <View style={styles.header}>
+          <View>
+            <Text style={styles.title}>AstroEnhancer</Text>
+            <Text style={styles.subtitle}>Deep-Sky & Planetary GPU Processor</Text>
+          </View>
+          <Pressable style={styles.primaryBtn} onPress={pickImage}>
+            <Text style={styles.primaryBtnText}>{imageUri ? 'Change Photo' : 'Open Photo'}</Text>
+          </Pressable>
+        </View>
+
+        {/* Preview Viewport */}
+        <View style={[styles.canvasContainer, { height: canvasDimensions.height + 16 }]}>
+          {skImage && runtimeEffect ? (
+            <Pressable
+              onPressIn={() => setShowOriginal(true)}
+              onPressOut={() => setShowOriginal(false)}
+              style={{ width: canvasDimensions.width, height: canvasDimensions.height }}
+            >
+              <Canvas style={{ width: canvasDimensions.width, height: canvasDimensions.height }}>
+                <Fill>
+                  <Shader source={runtimeEffect} uniforms={uniforms}>
+                    <ImageShader
+                      image={skImage}
+                      fit="contain"
+                      rect={{
+                        x: 0,
+                        y: 0,
+                        width: canvasDimensions.width,
+                        height: canvasDimensions.height,
+                      }}
+                    />
+                  </Shader>
+                </Fill>
+              </Canvas>
+              <View style={styles.badge}>
+                <Text style={styles.badgeText}>
+                  {showOriginal ? 'RAW ORIGINAL' : 'ENHANCED (HOLD TO COMPARE)'}
+                </Text>
+              </View>
+            </Pressable>
+          ) : (
+            <Pressable style={styles.emptyState} onPress={pickImage}>
+              <Text style={styles.emptyTitle}>Tap to Load Astrophoto</Text>
+              <Text style={styles.emptyDesc}>
+                Supports Nebulas, Galaxies, Moon, Planets & Star Clusters (JPEG/PNG/TIFF)
+              </Text>
+            </Pressable>
+          )}
+        </View>
+
+        {/* Target Presets */}
+        {skImage && (
+          <>
+            <Text style={styles.sectionTitle}>Auto Enhancement Profiles</Text>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.presetRow}>
+              {ASTRO_PRESETS.map((preset) => {
+                const isSelected = activePresetId === preset.id;
+                return (
+                  <Pressable
+                    key={preset.id}
+                    style={[styles.presetCard, isSelected && styles.presetCardActive]}
+                    onPress={() => applyPreset(preset.id)}
+                  >
+                    <Text style={[styles.presetName, isSelected && styles.presetNameActive]}>
+                      {preset.name}
+                    </Text>
+                    <Text style={styles.presetDesc}>{preset.description}</Text>
+                  </Pressable>
+                );
+              })}
+            </ScrollView>
+
+            {/* Manual Fine-Tuning */}
+            <Text style={styles.sectionTitle}>Fine-Tune Pipeline</Text>
+            <View style={styles.controlsCard}>
+              <ControlRow
+                label="Asinh Stretch (Faint Detail)"
+                value={params.stretch}
+                onDec={() => adjustParam('stretch', -0.05, 0, 1)}
+                onInc={() => adjustParam('stretch', 0.05, 0, 1)}
+              />
+              <ControlRow
+                label="Skyglow Neutralizer"
+                value={params.skyNeutral}
+                onDec={() => adjustParam('skyNeutral', -0.05, 0, 1)}
+                onInc={() => adjustParam('skyNeutral', 0.05, 0, 1)}
+              />
+              <ControlRow
+                label="Black Point Floor"
+                value={params.blackPoint}
+                onDec={() => adjustParam('blackPoint', -0.02, 0, 0.35)}
+                onInc={() => adjustParam('blackPoint', 0.02, 0, 0.35)}
+              />
+              <ControlRow
+                label="Deconvolution Sharpen"
+                value={params.sharpen}
+                onDec={() => adjustParam('sharpen', -0.1, 0, 1.5)}
+                onInc={() => adjustParam('sharpen', 0.1, 0, 1.5)}
+              />
+              <ControlRow
+                label="Astro Vibrance"
+                value={params.vibrance}
+                onDec={() => adjustParam('vibrance', -0.1, 0, 1.5)}
+                onInc={() => adjustParam('vibrance', 0.1, 0, 1.5)}
+              />
+              <ControlRow
+                label="Background Denoise"
+                value={params.denoise}
+                onDec={() => adjustParam('denoise', -0.05, 0, 1)}
+                onInc={() => adjustParam('denoise', 0.05, 0, 1)}
+              />
+            </View>
+
+            {/* Export Button */}
+            <Pressable
+              style={[styles.exportBtn, isSaving && styles.exportBtnDisabled]}
+              onPress={exportFullResolution}
+              disabled={isSaving}
+            >
+              {isSaving ? (
+                <ActivityIndicator color="#0B0F19" />
+              ) : (
+                <Text style={styles.exportBtnText}>
+                  Save Full-Resolution Image ({skImage.width()}x{skImage.height()})
+                </Text>
+              )}
+            </Pressable>
+          </>
+        )}
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+function ControlRow({
+  label,
+  value,
+  onDec,
+  onInc,
+}: {
+  label: string;
+  value: number;
+  onDec: () => void;
+  onInc: () => void;
+}) {
+  return (
+    <View style={styles.controlRow}>
+      <Text style={styles.controlLabel}>{label}</Text>
+      <View style={styles.stepper}>
+        <Pressable style={styles.stepBtn} onPress={onDec}>
+          <Text style={styles.stepBtnText}>-</Text>
+        </Pressable>
+        <Text style={styles.stepVal}>{Math.round(value * 100)}%</Text>
+        <Pressable style={styles.stepBtn} onPress={onInc}>
+          <Text style={styles.stepBtnText}>+</Text>
+        </Pressable>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#070A12',
+  },
+  scrollContent: {
+    padding: 16,
+    paddingBottom: 40,
+  },
+  header: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 16,
+  },
+  title: {
+    fontSize: 22,
+    fontWeight: '700',
+    color: '#F8FAFC',
+  },
+  subtitle: {
+    fontSize: 12,
+    color: '#94A3B8',
+    marginTop: 2,
+  },
+  primaryBtn: {
+    backgroundColor: '#1E293B',
+    borderColor: '#38BDF8',
+    borderWidth: 1,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 8,
+  },
+  primaryBtnText: {
+    color: '#38BDF8',
+    fontWeight: '600',
+    fontSize: 14,
+  },
+  canvasContainer: {
+    backgroundColor: '#0D1322',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#1E293B',
+    justifyContent: 'center',
+    alignItems: 'center',
+    overflow: 'hidden',
+    marginBottom: 20,
+  },
+  emptyState: {
+    padding: 32,
+    alignItems: 'center',
+  },
+  emptyTitle: {
+    color: '#E2E8F0',
+    fontSize: 17,
+    fontWeight: '600',
+    marginBottom: 6,
+  },
+  emptyDesc: {
+    color: '#64748B',
+    fontSize: 13,
+    textAlign: 'center',
+  },
+  badge: {
+    position: 'absolute',
+    bottom: 8,
+    alignSelf: 'center',
+    backgroundColor: 'rgba(7, 10, 18, 0.78)',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 6,
+  },
+  badgeText: {
+    color: '#CBD5E1',
+    fontSize: 10,
+    fontWeight: '700',
+    letterSpacing: 0.6,
+  },
+  sectionTitle: {
+    color: '#E2E8F0',
+    fontSize: 15,
+    fontWeight: '600',
+    marginBottom: 10,
+  },
+  presetRow: {
+    marginBottom: 20,
+  },
+  presetCard: {
+    width: 165,
+    backgroundColor: '#0F172A',
+    borderWidth: 1,
+    borderColor: '#1E293B',
+    borderRadius: 10,
+    padding: 12,
+    marginRight: 10,
+  },
+  presetCardActive: {
+    borderColor: '#38BDF8',
+    backgroundColor: '#132238',
+  },
+  presetName: {
+    color: '#F1F5F9',
+    fontWeight: '700',
+    fontSize: 14,
+    marginBottom: 4,
+  },
+  presetNameActive: {
+    color: '#38BDF8',
+  },
+  presetDesc: {
+    color: '#94A3B8',
+    fontSize: 11,
+    lineHeight: 15,
+  },
+  controlsCard: {
+    backgroundColor: '#0F172A',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#1E293B',
+    padding: 12,
+    marginBottom: 20,
+  },
+  controlRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: '#1E293B',
+  },
+  controlLabel: {
+    color: '#CBD5E1',
+    fontSize: 13,
+    flex: 1,
+  },
+  stepper: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  stepBtn: {
+    backgroundColor: '#1E293B',
+    width: 30,
+    height: 30,
+    borderRadius: 6,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  stepBtnText: {
+    color: '#F8FAFC',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  stepVal: {
+    color: '#38BDF8',
+    width: 48,
+    textAlign: 'center',
+    fontWeight: '600',
+    fontSize: 13,
+  },
+  exportBtn: {
+    backgroundColor: '#38BDF8',
+    paddingVertical: 14,
+    borderRadius: 10,
+    alignItems: 'center',
+  },
+  exportBtnDisabled: {
+    opacity: 0.6,
+  },
+  exportBtnText: {
+    color: '#070A12',
+    fontWeight: '700',
+    fontSize: 15,
+  },
+});
