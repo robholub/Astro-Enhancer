@@ -1,0 +1,42 @@
+{
+  "expo": {
+    "name": "AstroEnhancer",
+    "slug": "astro-enhancer",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.astroenhancer.app",
+      "deploymentTarget": "15.1",
+      "infoPlist": {
+        "NSPhotoLibraryUsageDescription": "Select astrophotography images from your library for processing.",
+        "NSPhotoLibraryAddUsageDescription": "Save enhanced astrophotography images to your photo library."
+      }
+    },
+    "android": {
+      "package": "com.astroenhancer.app",
+      "minSdkVersion": 26,
+      "permissions": [
+        "READ_MEDIA_IMAGES",
+        "WRITE_EXTERNAL_STORAGE"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow AstroEnhancer to open your astrophotography images."
+        }
+      ],
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Allow AstroEnhancer to access your photo library.",
+          "savePhotosPermission": "Allow AstroEnhancer to save enhanced astrophotos.",
+          "isAccessMediaLocationEnabled": true
+        }
+      ]
+    ]
+  }
+}
