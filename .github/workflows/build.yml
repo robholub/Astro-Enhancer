@@ -1,119 +1,11 @@
-name: Build Android APK (Native GitHub Runner)
-
-on:
-  push:
-    branches:
-      - main
-  workflow_dispatch:
-
-jobs:
-  build_android:
-    name: Build Android APK
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v5
-        with:
-          node-version: 22
-
-      - name: Setup Java JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
-
-      - name: Generate App Icon
-        run: |
-          node -e '
-          const fs = require("fs");
-          const zlib = require("zlib");
-          fs.mkdirSync("assets", { recursive: true });
-          const W = 1024, H = 1024;
-          const raw = Buffer.alloc((W * 4 + 1) * H);
-
-          function insideStar(x, y, cx, cy, rOuter, rInner) {
-            const dx = Math.abs(x - cx), dy = Math.abs(y - cy);
-            if (dx > rOuter || dy > rOuter) return false;
-            return (dx / rOuter + dy / rInner <= 1) || (dx / rInner + dy / rOuter <= 1);
-          }
-
-          for (let y = 0; y < H; y++) {
-            const row = y * (W * 4 + 1);
-            raw[row] = 0;
-            for (let x = 0; x < W; x++) {
-              const dist = Math.hypot(x - 512, y - 512) / 512;
-              const neb = Math.max(0, 1 - dist);
-              const neb2 = Math.max(0, 1 - Math.hypot(x - 550, y - 470) / 380);
-              let r = Math.min(255, Math.round(7 + 28 * neb * neb + 45 * neb2 * neb2));
-              let g = Math.min(255, Math.round(10 + 55 * neb * neb + 25 * neb2 * neb2));
-              let b = Math.min(255, Math.round(18 + 125 * neb + 70 * neb2 * neb2));
-
-              if (insideStar(x, y, 512, 512, 240, 34)) {
-                r = 248; g = 250; b = 252;
-              } else if (
-                Math.hypot(x - 690, y - 330) <= 13 ||
-                Math.hypot(x - 340, y - 670) <= 10 ||
-                Math.hypot(x - 715, y - 655) <= 9
-              ) {
-                r = 56; g = 189; b = 248;
-              }
-
-              const idx = row + 1 + x * 4;
-              raw[idx] = r; raw[idx + 1] = g; raw[idx + 2] = b; raw[idx + 3] = 255;
-            }
-          }
-
-          const crcTable = new Uint32Array(256);
-          for (let n = 0; n < 256; n++) {
-            let c = n;
-            for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
-            crcTable[n] = c;
-          }
-          function crc32(buf) {
-            let c = 0xffffffff;
-            for (let i = 0; i < buf.length; i++) c = crcTable[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
-            return (c ^ 0xffffffff) >>> 0;
-          }
-          function chunk(type, data) {
-            const t = Buffer.from(type);
-            const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
-            const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(Buffer.concat([t, data])));
-            return Buffer.concat([len, t, data, crc]);
-          }
-
-          const ihdr = Buffer.alloc(13);
-          ihdr.writeUInt32BE(W, 0); ihdr.writeUInt32BE(H, 4);
-          ihdr[8] = 8; ihdr[9] = 6;
-          const png = Buffer.concat([
-            Buffer.from([137,80,78,71,13,10,26,10]),
-            chunk("IHDR", ihdr),
-            chunk("IDAT", zlib.deflateSync(raw)),
-            chunk("IEND", Buffer.alloc(0))
-          ]);
-          fs.writeFileSync("assets/icon.png", png);
-          '
-
-      - name: Install dependencies
-        run: npm install --legacy-peer-deps && npx expo install --fix
-
-      - name: Generate Native Android Project
-        run: npx expo prebuild --platform android --non-interactive
-
       - name: Restore Release Keystore Signing
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
         run: |
           echo "$KEYSTORE_B64" | base64 --decode > android/app/release.keystore
 
-          cat << 'EOF' >> android/gradle.properties
-          MYAPP_UPLOAD_STORE_FILE=release.keystore
-          MYAPP_UPLOAD_KEY_ALIAS=astrokey
-          MYAPP_UPLOAD_STORE_PASSWORD=astro1234
-          MYAPP_UPLOAD_KEY_PASSWORD=astro1234
-          EOF
+          printf "MYAPP_UPLOAD_STORE_FILE=release.keystore\nMYAPP_UPLOAD_KEY_ALIAS=astrokey\nMYAPP_UPLOAD_STORE_PASSWORD=%s\nMYAPP_UPLOAD_KEY_PASSWORD=%s\n" "$KEYSTORE_PASS" "$KEYSTORE_PASS" >> android/gradle.properties
 
           node -e '
           const fs = require("fs");
@@ -135,16 +27,3 @@ jobs:
           );
           fs.writeFileSync(gradlePath, content);
           '
-
-      - name: Build Release APK with Gradle
-        run: |
-          cd android
-          chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon
-
-      - name: Upload APK Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: AstroEnhancer-Android-APK
-          path: android/app/build/outputs/apk/release/app-release.apk
-          if-no-files-found: error
