@@ -21,7 +21,9 @@ import * as MediaLibrary from 'expo-media-library';
 import * as Sharing from 'expo-sharing';
 import { File, Paths } from 'expo-file-system';
 import {
+  AlphaType,
   Canvas,
+  ColorType,
   Fill,
   FilterMode,
   ImageFormat,
@@ -29,6 +31,7 @@ import {
   MipmapMode,
   Shader,
   SkImage,
+  SkRuntimeEffect,
   Skia,
   TileMode,
   useImage,
@@ -46,23 +49,134 @@ type CropAspect = 'original' | '1:1' | '4:5' | '16:9';
 type ExportFormat = 'png' | 'jpeg';
 type EditorTab = 'tune' | 'crop' | 'presets';
 
+interface HistData {
+  r: number[];
+  g: number[];
+  b: number[];
+}
+
 interface ImageAnalysis {
   autoParams: AstroParams;
   bgModel: BgCornerModel;
-  histR: number[];
-  histG: number[];
-  histB: number[];
 }
 
 const CUSTOM_PRESETS_FILE = new File(Paths.document, 'astro_custom_presets.json');
+
+function readRGBA8888Pixels(snap: SkImage, width: number, height: number): Uint8Array | null {
+  try {
+    const info = {
+      width,
+      height,
+      colorType: ColorType.RGBA_8888,
+      alphaType: AlphaType.Premul,
+    };
+    const raw = snap.readPixels(0, 0, info);
+    if (!raw) return null;
+    if (raw instanceof Uint8Array) return raw;
+    return new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+  } catch {
+    return null;
+  }
+}
+
+function computeHistogramFromPixels(pixels: Uint8Array): HistData {
+  const bins = 32;
+  const histR = new Array(bins).fill(0);
+  const histG = new Array(bins).fill(0);
+  const histB = new Array(bins).fill(0);
+
+  for (let i = 0; i < pixels.length; i += 4) {
+    const r = pixels[i] / 255;
+    const g = pixels[i + 1] / 255;
+    const b = pixels[i + 2] / 255;
+    histR[Math.min(bins - 1, Math.floor(r * bins))]++;
+    histG[Math.min(bins - 1, Math.floor(g * bins))]++;
+    histB[Math.min(bins - 1, Math.floor(b * bins))]++;
+  }
+
+  // Log-scale counts so faint nebula/star midtone curves are clearly visible alongside the dark sky peak
+  const logR = histR.map((v) => Math.log1p(v));
+  const logG = histG.map((v) => Math.log1p(v));
+  const logB = histB.map((v) => Math.log1p(v));
+
+  const maxLog = Math.max(0.001, ...logR, ...logG, ...logB);
+  return {
+    r: logR.map((v) => v / maxLog),
+    g: logG.map((v) => v / maxLog),
+    b: logB.map((v) => v / maxLog),
+  };
+}
+
+function computeLiveHistogram(
+  img: SkImage,
+  effect: SkRuntimeEffect | null,
+  params: AstroParams,
+  bgModel: BgCornerModel
+): HistData | null {
+  try {
+    const N = 64;
+    const surface = Skia.Surface.MakeOffscreen(N, N);
+    if (!surface) return null;
+
+    const canvas = surface.getCanvas();
+    const paint = Skia.Paint();
+
+    if (effect) {
+      const imgShader = img.makeShaderOptions(
+        TileMode.Clamp,
+        TileMode.Clamp,
+        FilterMode.Linear,
+        MipmapMode.None
+      );
+      const uniformValues = [
+        img.width(),
+        img.height(),
+        params.stretch,
+        params.blackPoint,
+        params.bgExtract,
+        params.scnrGreen,
+        params.waveletFine,
+        params.waveletMed,
+        params.denoise,
+        params.vibrance,
+        params.temperature,
+        params.tint,
+        params.starControl,
+        ...bgModel.tl,
+        ...bgModel.tr,
+        ...bgModel.bl,
+        ...bgModel.br,
+        0.0,
+      ];
+      const shader = effect.makeShaderWithChildren(uniformValues, [imgShader]);
+      paint.setShader(shader);
+      canvas.save();
+      canvas.scale(N / img.width(), N / img.height());
+      canvas.drawRect(Skia.XYWHRect(0, 0, img.width(), img.height()), paint);
+      canvas.restore();
+    } else {
+      canvas.drawImageRect(
+        img,
+        Skia.XYWHRect(0, 0, img.width(), img.height()),
+        Skia.XYWHRect(0, 0, N, N),
+        paint
+      );
+    }
+
+    surface.flush();
+    const snap = surface.makeImageSnapshot();
+    const pixels = readRGBA8888Pixels(snap, N, N);
+    if (!pixels) return null;
+    return computeHistogramFromPixels(pixels);
+  } catch {
+    return null;
+  }
+}
 
 function analyzeAstroImage(img: SkImage): ImageAnalysis {
   const defaultResult: ImageAnalysis = {
     autoParams: ASTRO_PRESETS[0].params,
     bgModel: DEFAULT_BG_MODEL,
-    histR: new Array(32).fill(0.1),
-    histG: new Array(32).fill(0.1),
-    histB: new Array(32).fill(0.1),
   };
 
   try {
@@ -81,15 +195,10 @@ function analyzeAstroImage(img: SkImage): ImageAnalysis {
     surface.flush();
 
     const snap = surface.makeImageSnapshot();
-    const pixels = snap.readPixels(0, 0);
+    const pixels = readRGBA8888Pixels(snap, N, N);
     if (!pixels) return defaultResult;
 
     const lumas: number[] = [];
-    const histR = new Array(32).fill(0);
-    const histG = new Array(32).fill(0);
-    const histB = new Array(32).fill(0);
-
-    // Quadrant collectors for 2D Dynamic Background Extraction (DBE)
     const qTL: { l: number; rgb: [number, number, number] }[] = [];
     const qTR: { l: number; rgb: [number, number, number] }[] = [];
     const qBL: { l: number; rgb: [number, number, number] }[] = [];
@@ -104,10 +213,6 @@ function analyzeAstroImage(img: SkImage): ImageAnalysis {
         const l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
         lumas.push(l);
 
-        histR[Math.min(31, Math.floor(r * 32))]++;
-        histG[Math.min(31, Math.floor(g * 32))]++;
-        histB[Math.min(31, Math.floor(b * 32))]++;
-
         const entry = { l, rgb: [r, g, b] as [number, number, number] };
         if (y < N / 2 && x < N / 2) qTL.push(entry);
         else if (y < N / 2 && x >= N / 2) qTR.push(entry);
@@ -116,12 +221,6 @@ function analyzeAstroImage(img: SkImage): ImageAnalysis {
       }
     }
 
-    const maxBin = Math.max(1, ...histR, ...histG, ...histB);
-    const normR = histR.map((v) => v / maxBin);
-    const normG = histG.map((v) => v / maxBin);
-    const normB = histB.map((v) => v / maxBin);
-
-    // Extract 15th-percentile sky floor in each quadrant (ignores stars & galaxy cores)
     const getQuadrantSky = (arr: { l: number; rgb: [number, number, number] }[]): [number, number, number] => {
       if (arr.length === 0) return [0, 0, 0];
       arr.sort((a, b) => a.l - b.l);
@@ -154,9 +253,6 @@ function analyzeAstroImage(img: SkImage): ImageAnalysis {
     if (isBrightTarget) {
       return {
         bgModel: DEFAULT_BG_MODEL,
-        histR: normR,
-        histG: normG,
-        histB: normB,
         autoParams: {
           stretch: 0.18,
           blackPoint: Math.min(0.08, Math.max(0.01, Number((p10 * 0.7).toFixed(2)))),
@@ -168,7 +264,7 @@ function analyzeAstroImage(img: SkImage): ImageAnalysis {
           vibrance: 0.3,
           temperature: 0.0,
           tint: 0.0,
-          starControl: 0.15,
+          starControl: 0.0,
         },
       };
     }
@@ -178,9 +274,6 @@ function analyzeAstroImage(img: SkImage): ImageAnalysis {
 
     return {
       bgModel,
-      histR: normR,
-      histG: normG,
-      histB: normB,
       autoParams: {
         stretch: autoStretch,
         blackPoint: autoBlack,
@@ -188,11 +281,11 @@ function analyzeAstroImage(img: SkImage): ImageAnalysis {
         scnrGreen: 0.6,
         waveletFine: 0.42,
         waveletMed: 0.35,
-        denoise: 0.76,
+        denoise: 0.68,
         vibrance: 0.42,
         temperature: 0.0,
         tint: 0.0,
-        starControl: 0.78,
+        starControl: 0.38,
       },
     };
   } catch {
@@ -218,7 +311,7 @@ function AstroEditorScreen() {
   const [customPresets, setCustomPresets] = useState<AstroPreset[]>([]);
   const [params, setParams] = useState<AstroParams>(ASTRO_PRESETS[0].params);
   const [bgModel, setBgModel] = useState<BgCornerModel>(DEFAULT_BG_MODEL);
-  const [histData, setHistData] = useState<{ r: number[]; g: number[]; b: number[] } | null>(null);
+  const [histData, setHistData] = useState<HistData | null>(null);
 
   // Viewport inspection modes
   const [showOriginal, setShowOriginal] = useState<boolean>(false);
@@ -229,8 +322,8 @@ function AstroEditorScreen() {
 
   // Framing: Crop & Rotate
   const [cropAspect, setCropAspect] = useState<CropAspect>('original');
-  const [quarterTurns, setQuarterTurns] = useState<number>(0); // 0, 1, 2, 3 (90 deg steps)
-  const [fineAngle, setFineAngle] = useState<number>(0); // -15 to +15 deg
+  const [quarterTurns, setQuarterTurns] = useState<number>(0);
+  const [fineAngle, setFineAngle] = useState<number>(0);
 
   // Export & Save Preset Modal
   const [exportFormat, setExportFormat] = useState<ExportFormat>('png');
@@ -256,7 +349,6 @@ function AstroEditorScreen() {
 
   const skImage = useImage(imageUri);
 
-  // Load saved custom presets from device storage on startup
   useEffect(() => {
     try {
       if (CUSTOM_PRESETS_FILE.exists) {
@@ -280,11 +372,18 @@ function AstroEditorScreen() {
     }
   };
 
+  const runtimeEffect = useMemo(() => {
+    const effect = Skia.RuntimeEffect.Make(ASTRO_SKSL_SHADER);
+    if (!effect) {
+      console.error('Failed to compile Astro SkSL shader');
+    }
+    return effect;
+  }, []);
+
   useEffect(() => {
     if (skImage) {
       const analysis = analyzeAstroImage(skImage);
       setBgModel(analysis.bgModel);
-      setHistData({ r: analysis.histR, g: analysis.histG, b: analysis.histB });
       setActivePresetId('auto_pro');
       setParams(analysis.autoParams);
       setCropAspect('original');
@@ -296,15 +395,16 @@ function AstroEditorScreen() {
     }
   }, [skImage]);
 
-  const runtimeEffect = useMemo(() => {
-    const effect = Skia.RuntimeEffect.Make(ASTRO_SKSL_SHADER);
-    if (!effect) {
-      console.error('Failed to compile Astro SkSL shader');
-    }
-    return effect;
-  }, []);
+  const originalPreset = ASTRO_PRESETS[ASTRO_PRESETS.length - 1];
+  const activeParams = showOriginal ? originalPreset.params : params;
 
-  // Compute cropped & rotated source rectangle in native image pixels
+  // Recompute live RGB histogram whenever Hist HUD is visible and sliders/presets change
+  useEffect(() => {
+    if (!skImage || !showHistogram) return;
+    const h = computeLiveHistogram(skImage, runtimeEffect, activeParams, bgModel);
+    if (h) setHistData(h);
+  }, [skImage, runtimeEffect, activeParams, bgModel, showHistogram]);
+
   const cropRect = useMemo(() => {
     if (!skImage) return { x: 0, y: 0, w: 100, h: 100 };
     const isRotated90 = quarterTurns % 2 === 1;
@@ -442,7 +542,6 @@ function AstroEditorScreen() {
     [clampPan, maxZoom, splitEnabled]
   );
 
-  // Split-screen before/after wipe responder
   const splitStartRef = useRef(0.5);
   const splitPanResponder = useMemo(
     () =>
@@ -453,7 +552,10 @@ function AstroEditorScreen() {
           splitStartRef.current = splitRatio;
         },
         onPanResponderMove: (_, gs) => {
-          const next = Math.min(0.95, Math.max(0.05, splitStartRef.current + gs.dx / Math.max(1, canvasDimensions.width)));
+          const next = Math.min(
+            0.95,
+            Math.max(0.05, splitStartRef.current + gs.dx / Math.max(1, canvasDimensions.width))
+          );
           setSplitRatio(next);
         },
       }),
@@ -543,7 +645,6 @@ function AstroEditorScreen() {
     ]);
   };
 
-  // Renders full-resolution cropped & rotated output file
   const renderProcessedFile = async (): Promise<{ uri: string; width: number; height: number }> => {
     if (!skImage || !runtimeEffect) {
       throw new Error('Image or shader not ready');
@@ -582,7 +683,7 @@ function AstroEditorScreen() {
       ...bgModel.tr,
       ...bgModel.bl,
       ...bgModel.br,
-      0.0, // Never bake clipping warning overlay into exported files
+      0.0,
     ];
 
     const finalShader = runtimeEffect.makeShaderWithChildren(uniformValues, [imgShader]);
@@ -590,13 +691,11 @@ function AstroEditorScreen() {
     const paint = Skia.Paint();
     paint.setShader(finalShader);
 
-    // Apply crop offset & rotation transforms in native pixel space
     canvas.save();
     canvas.translate(outW / 2, outH / 2);
     const totalDeg = quarterTurns * 90 + fineAngle;
     if (totalDeg !== 0) {
       canvas.rotate(totalDeg, 0, 0);
-      // Slight auto-scale when fine-tilting so corners never show black triangles
       if (fineAngle !== 0) {
         const rad = (Math.abs(fineAngle) * Math.PI) / 180;
         const zoomFill = Math.cos(rad) + Math.sin(rad) * Math.max(outW / outH, outH / outW);
@@ -662,9 +761,6 @@ function AstroEditorScreen() {
     }
   };
 
-  const originalPreset = ASTRO_PRESETS[ASTRO_PRESETS.length - 1];
-  const activeParams = showOriginal ? originalPreset.params : params;
-
   const buildUniformObj = (p: AstroParams, clipFlag: boolean) => ({
     resolution: [canvasDimensions.width, canvasDimensions.height],
     stretch: p.stretch,
@@ -694,7 +790,6 @@ function AstroEditorScreen() {
 
   const allPresets = useMemo(() => [...customPresets, ...ASTRO_PRESETS], [customPresets]);
 
-  // Compute preview transform including crop aspect & rotation
   const totalPreviewDeg = quarterTurns * 90 + fineAngle;
   const fineFillScale = useMemo(() => {
     if (fineAngle === 0) return 1;
@@ -736,7 +831,6 @@ function AstroEditorScreen() {
                   { width: canvasDimensions.width, height: canvasDimensions.height },
                 ]}
               >
-                {/* Processed (or Raw Toggle) Layer */}
                 <View
                   style={{
                     width: canvasDimensions.width,
@@ -770,7 +864,6 @@ function AstroEditorScreen() {
                   </Canvas>
                 </View>
 
-                {/* Split-Screen Raw Overlay (Left Side) */}
                 {splitEnabled && (
                   <View
                     pointerEvents="none"
@@ -815,7 +908,6 @@ function AstroEditorScreen() {
                   </View>
                 )}
 
-                {/* Draggable Split Wipe Handle */}
                 {splitEnabled && (
                   <View
                     {...splitPanResponder.panHandlers}
@@ -837,13 +929,37 @@ function AstroEditorScreen() {
                     <View style={styles.histBars}>
                       {histData.r.map((_, i) => (
                         <View key={i} style={styles.histCol}>
-                          <View style={[styles.histBar, { height: Math.max(2, histData.b[i] * 34), backgroundColor: 'rgba(56,189,248,0.65)' }]} />
-                          <View style={[styles.histBar, { height: Math.max(2, histData.g[i] * 34), backgroundColor: 'rgba(74,222,128,0.55)' }]} />
-                          <View style={[styles.histBar, { height: Math.max(2, histData.r[i] * 34), backgroundColor: 'rgba(248,113,113,0.55)' }]} />
+                          <View
+                            style={[
+                              styles.histBar,
+                              {
+                                height: Math.max(2, histData.b[i] * 44),
+                                backgroundColor: 'rgba(56,189,248,0.65)',
+                              },
+                            ]}
+                          />
+                          <View
+                            style={[
+                              styles.histBar,
+                              {
+                                height: Math.max(2, histData.g[i] * 44),
+                                backgroundColor: 'rgba(74,222,128,0.55)',
+                              },
+                            ]}
+                          />
+                          <View
+                            style={[
+                              styles.histBar,
+                              {
+                                height: Math.max(2, histData.r[i] * 44),
+                                backgroundColor: 'rgba(248,113,113,0.55)',
+                              },
+                            ]}
+                          />
                         </View>
                       ))}
                     </View>
-                    <Text style={styles.histLabel}>RGB HISTOGRAM</Text>
+                    <Text style={styles.histLabel}>RGB HISTOGRAM (LOG)</Text>
                   </View>
                 )}
               </View>
@@ -916,7 +1032,6 @@ function AstroEditorScreen() {
       {/* MIDDLE SCROLLABLE AREA WITH TABS */}
       {skImage ? (
         <>
-          {/* Tab Switcher */}
           <View style={styles.tabBar}>
             <Pressable
               style={[styles.tabBtn, activeTab === 'tune' && styles.tabBtnActive]}
@@ -1005,7 +1120,7 @@ function AstroEditorScreen() {
                   onChange={(v) => updateParamValue('scnrGreen', v)}
                 />
                 <SliderRow
-                  label="Star Control & White Cores"
+                  label="Star Halo Tightening"
                   value={params.starControl}
                   min={0}
                   max={1}
@@ -1133,7 +1248,6 @@ function AstroEditorScreen() {
           {/* PINNED BOTTOM: Format Toggle + Save + Share */}
           <View style={[styles.pinnedBottom, { paddingBottom: Math.max(12, insets.bottom + 8) }]}>
             <View style={styles.bottomRow}>
-              {/* PNG / JPEG Pill */}
               <Pressable
                 style={styles.formatBtn}
                 onPress={() => setExportFormat((f) => (f === 'png' ? 'jpeg' : 'png'))}
@@ -1141,7 +1255,6 @@ function AstroEditorScreen() {
                 <Text style={styles.formatBtnText}>{exportFormat.toUpperCase()}</Text>
               </Pressable>
 
-              {/* Main Save Button */}
               <Pressable
                 style={[styles.exportBtn, isExporting && styles.exportBtnDisabled]}
                 onPress={handleSaveToGallery}
@@ -1156,7 +1269,6 @@ function AstroEditorScreen() {
                 )}
               </Pressable>
 
-              {/* Share Button */}
               <Pressable
                 style={[styles.shareBtn, isExporting && styles.exportBtnDisabled]}
                 onPress={handleShareImage}
@@ -1381,33 +1493,35 @@ const styles = StyleSheet.create({
     position: 'absolute',
     top: 8,
     right: 8,
-    backgroundColor: 'rgba(7, 10, 18, 0.82)',
-    borderColor: '#1E293B',
+    backgroundColor: 'rgba(7, 10, 18, 0.88)',
+    borderColor: '#334155',
     borderWidth: 1,
-    borderRadius: 6,
-    padding: 5,
+    borderRadius: 8,
+    padding: 6,
   },
   histBars: {
     flexDirection: 'row',
     alignItems: 'flex-end',
-    height: 34,
-    gap: 1,
+    height: 44,
+    gap: 1.5,
   },
   histCol: {
-    width: 2.5,
-    height: 34,
+    width: 3,
+    height: 44,
     justifyContent: 'flex-end',
   },
   histBar: {
     position: 'absolute',
     bottom: 0,
-    width: 2.5,
+    width: 3,
+    borderTopLeftRadius: 1,
+    borderTopRightRadius: 1,
   },
   histLabel: {
-    color: '#94A3B8',
+    color: '#CBD5E1',
     fontSize: 8,
     fontWeight: '700',
-    marginTop: 2,
+    marginTop: 3,
     textAlign: 'center',
   },
   viewportBar: {
