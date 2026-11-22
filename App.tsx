@@ -4,11 +4,13 @@ import {
   Alert,
   GestureResponderEvent,
   LayoutChangeEvent,
+  Modal,
   PanResponder,
   Pressable,
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   View,
   useWindowDimensions,
 } from 'react-native';
@@ -16,11 +18,13 @@ import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as ImagePicker from 'expo-image-picker';
 import * as MediaLibrary from 'expo-media-library';
+import * as Sharing from 'expo-sharing';
 import { File, Paths } from 'expo-file-system';
 import {
   Canvas,
   Fill,
   FilterMode,
+  ImageFormat,
   ImageShader,
   MipmapMode,
   Shader,
@@ -29,35 +33,116 @@ import {
   TileMode,
   useImage,
 } from 'react-native-skia';
-import { ASTRO_PRESETS, ASTRO_SKSL_SHADER, AstroParams } from './src/astroShader';
+import {
+  ASTRO_PRESETS,
+  ASTRO_SKSL_SHADER,
+  AstroParams,
+  AstroPreset,
+  BgCornerModel,
+  DEFAULT_BG_MODEL,
+} from './src/astroShader';
 
-function computeAutoParams(img: SkImage): AstroParams {
+type CropAspect = 'original' | '1:1' | '4:5' | '16:9';
+type ExportFormat = 'png' | 'jpeg';
+type EditorTab = 'tune' | 'crop' | 'presets';
+
+interface ImageAnalysis {
+  autoParams: AstroParams;
+  bgModel: BgCornerModel;
+  histR: number[];
+  histG: number[];
+  histB: number[];
+}
+
+const CUSTOM_PRESETS_FILE = new File(Paths.document, 'astro_custom_presets.json');
+
+function analyzeAstroImage(img: SkImage): ImageAnalysis {
+  const defaultResult: ImageAnalysis = {
+    autoParams: ASTRO_PRESETS[0].params,
+    bgModel: DEFAULT_BG_MODEL,
+    histR: new Array(32).fill(0.1),
+    histG: new Array(32).fill(0.1),
+    histB: new Array(32).fill(0.1),
+  };
+
   try {
-    const sampleSize = 64;
-    const surface = Skia.Surface.MakeOffscreen(sampleSize, sampleSize);
-    if (!surface) return ASTRO_PRESETS[0].params;
+    const N = 64;
+    const surface = Skia.Surface.MakeOffscreen(N, N);
+    if (!surface) return defaultResult;
 
     const canvas = surface.getCanvas();
     const paint = Skia.Paint();
     canvas.drawImageRect(
       img,
       Skia.XYWHRect(0, 0, img.width(), img.height()),
-      Skia.XYWHRect(0, 0, sampleSize, sampleSize),
+      Skia.XYWHRect(0, 0, N, N),
       paint
     );
     surface.flush();
 
     const snap = surface.makeImageSnapshot();
     const pixels = snap.readPixels(0, 0);
-    if (!pixels) return ASTRO_PRESETS[0].params;
+    if (!pixels) return defaultResult;
 
     const lumas: number[] = [];
-    for (let i = 0; i < pixels.length; i += 4) {
-      const r = pixels[i] / 255;
-      const g = pixels[i + 1] / 255;
-      const b = pixels[i + 2] / 255;
-      lumas.push(0.2126 * r + 0.7152 * g + 0.0722 * b);
+    const histR = new Array(32).fill(0);
+    const histG = new Array(32).fill(0);
+    const histB = new Array(32).fill(0);
+
+    // Quadrant collectors for 2D Dynamic Background Extraction (DBE)
+    const qTL: { l: number; rgb: [number, number, number] }[] = [];
+    const qTR: { l: number; rgb: [number, number, number] }[] = [];
+    const qBL: { l: number; rgb: [number, number, number] }[] = [];
+    const qBR: { l: number; rgb: [number, number, number] }[] = [];
+
+    for (let y = 0; y < N; y++) {
+      for (let x = 0; x < N; x++) {
+        const idx = (y * N + x) * 4;
+        const r = pixels[idx] / 255;
+        const g = pixels[idx + 1] / 255;
+        const b = pixels[idx + 2] / 255;
+        const l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        lumas.push(l);
+
+        histR[Math.min(31, Math.floor(r * 32))]++;
+        histG[Math.min(31, Math.floor(g * 32))]++;
+        histB[Math.min(31, Math.floor(b * 32))]++;
+
+        const entry = { l, rgb: [r, g, b] as [number, number, number] };
+        if (y < N / 2 && x < N / 2) qTL.push(entry);
+        else if (y < N / 2 && x >= N / 2) qTR.push(entry);
+        else if (y >= N / 2 && x < N / 2) qBL.push(entry);
+        else qBR.push(entry);
+      }
     }
+
+    const maxBin = Math.max(1, ...histR, ...histG, ...histB);
+    const normR = histR.map((v) => v / maxBin);
+    const normG = histG.map((v) => v / maxBin);
+    const normB = histB.map((v) => v / maxBin);
+
+    // Extract 15th-percentile sky floor in each quadrant (ignores stars & galaxy cores)
+    const getQuadrantSky = (arr: { l: number; rgb: [number, number, number] }[]): [number, number, number] => {
+      if (arr.length === 0) return [0, 0, 0];
+      arr.sort((a, b) => a.l - b.l);
+      const start = Math.floor(arr.length * 0.08);
+      const end = Math.max(start + 1, Math.floor(arr.length * 0.22));
+      let sr = 0, sg = 0, sb = 0, count = 0;
+      for (let i = start; i < end; i++) {
+        sr += arr[i].rgb[0];
+        sg += arr[i].rgb[1];
+        sb += arr[i].rgb[2];
+        count++;
+      }
+      return [sr / count, sg / count, sb / count];
+    };
+
+    const bgModel: BgCornerModel = {
+      tl: getQuadrantSky(qTL),
+      tr: getQuadrantSky(qTR),
+      bl: getQuadrantSky(qBL),
+      br: getQuadrantSky(qBR),
+    };
 
     lumas.sort((a, b) => a - b);
     const p10 = lumas[Math.floor(lumas.length * 0.1)] ?? 0.05;
@@ -68,28 +153,50 @@ function computeAutoParams(img: SkImage): AstroParams {
 
     if (isBrightTarget) {
       return {
-        stretch: 0.18,
-        blackPoint: Math.min(0.08, Math.max(0.01, Number((p10 * 0.7).toFixed(2)))),
-        sharpen: 1.05,
-        denoise: 0.45,
-        vibrance: 0.3,
-        starControl: 0.2,
+        bgModel: DEFAULT_BG_MODEL,
+        histR: normR,
+        histG: normG,
+        histB: normB,
+        autoParams: {
+          stretch: 0.18,
+          blackPoint: Math.min(0.08, Math.max(0.01, Number((p10 * 0.7).toFixed(2)))),
+          bgExtract: 0.0,
+          scnrGreen: 0.35,
+          waveletFine: 1.05,
+          waveletMed: 0.7,
+          denoise: 0.45,
+          vibrance: 0.3,
+          temperature: 0.0,
+          tint: 0.0,
+          starControl: 0.15,
+        },
       };
     }
 
     const autoStretch = Math.min(0.7, Math.max(0.28, Number((0.68 - p50 * 1.4).toFixed(2))));
-    const autoBlack = Math.min(0.22, Math.max(0.02, Number((p10 * 0.85).toFixed(2))));
+    const autoBlack = Math.min(0.2, Math.max(0.02, Number((p10 * 0.8).toFixed(2))));
 
     return {
-      stretch: autoStretch,
-      blackPoint: autoBlack,
-      sharpen: 0.45,
-      denoise: 0.75,
-      vibrance: 0.42,
-      starControl: 0.78,
+      bgModel,
+      histR: normR,
+      histG: normG,
+      histB: normB,
+      autoParams: {
+        stretch: autoStretch,
+        blackPoint: autoBlack,
+        bgExtract: 0.8,
+        scnrGreen: 0.6,
+        waveletFine: 0.42,
+        waveletMed: 0.35,
+        denoise: 0.76,
+        vibrance: 0.42,
+        temperature: 0.0,
+        tint: 0.0,
+        starControl: 0.78,
+      },
     };
   } catch {
-    return ASTRO_PRESETS[0].params;
+    return defaultResult;
   }
 }
 
@@ -106,10 +213,30 @@ function AstroEditorScreen() {
   const { width: screenWidth, height: screenHeight } = useWindowDimensions();
 
   const [imageUri, setImageUri] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<EditorTab>('tune');
   const [activePresetId, setActivePresetId] = useState<string>('auto_pro');
+  const [customPresets, setCustomPresets] = useState<AstroPreset[]>([]);
   const [params, setParams] = useState<AstroParams>(ASTRO_PRESETS[0].params);
+  const [bgModel, setBgModel] = useState<BgCornerModel>(DEFAULT_BG_MODEL);
+  const [histData, setHistData] = useState<{ r: number[]; g: number[]; b: number[] } | null>(null);
+
+  // Viewport inspection modes
   const [showOriginal, setShowOriginal] = useState<boolean>(false);
-  const [isSaving, setIsSaving] = useState<boolean>(false);
+  const [splitEnabled, setSplitEnabled] = useState<boolean>(false);
+  const [splitRatio, setSplitRatio] = useState<number>(0.5);
+  const [showHistogram, setShowHistogram] = useState<boolean>(false);
+  const [showClipping, setShowClipping] = useState<boolean>(false);
+
+  // Framing: Crop & Rotate
+  const [cropAspect, setCropAspect] = useState<CropAspect>('original');
+  const [quarterTurns, setQuarterTurns] = useState<number>(0); // 0, 1, 2, 3 (90 deg steps)
+  const [fineAngle, setFineAngle] = useState<number>(0); // -15 to +15 deg
+
+  // Export & Save Preset Modal
+  const [exportFormat, setExportFormat] = useState<ExportFormat>('png');
+  const [isExporting, setIsExporting] = useState<boolean>(false);
+  const [saveModalVisible, setSaveModalVisible] = useState<boolean>(false);
+  const [newPresetName, setNewPresetName] = useState<string>('');
   const [renderTick, setRenderTick] = useState<number>(0);
 
   // Pinch-to-zoom & pan state
@@ -129,11 +256,41 @@ function AstroEditorScreen() {
 
   const skImage = useImage(imageUri);
 
+  // Load saved custom presets from device storage on startup
+  useEffect(() => {
+    try {
+      if (CUSTOM_PRESETS_FILE.exists) {
+        const text = CUSTOM_PRESETS_FILE.textSync();
+        const parsed = JSON.parse(text);
+        if (Array.isArray(parsed)) {
+          setCustomPresets(parsed);
+        }
+      }
+    } catch {
+      // Ignore corrupt preset file
+    }
+  }, []);
+
+  const persistCustomPresets = (updated: AstroPreset[]) => {
+    setCustomPresets(updated);
+    try {
+      CUSTOM_PRESETS_FILE.write(JSON.stringify(updated));
+    } catch {
+      // Ignore write error
+    }
+  };
+
   useEffect(() => {
     if (skImage) {
-      const auto = computeAutoParams(skImage);
+      const analysis = analyzeAstroImage(skImage);
+      setBgModel(analysis.bgModel);
+      setHistData({ r: analysis.histR, g: analysis.histG, b: analysis.histB });
       setActivePresetId('auto_pro');
-      setParams(auto);
+      setParams(analysis.autoParams);
+      setCropAspect('original');
+      setQuarterTurns(0);
+      setFineAngle(0);
+      setShowOriginal(false);
       resetZoom();
       setRenderTick((t) => t + 1);
     }
@@ -147,22 +304,50 @@ function AstroEditorScreen() {
     return effect;
   }, []);
 
-  // Size preview proportionally so top preview + scrollable controls + bottom save bar all fit comfortably
+  // Compute cropped & rotated source rectangle in native image pixels
+  const cropRect = useMemo(() => {
+    if (!skImage) return { x: 0, y: 0, w: 100, h: 100 };
+    const isRotated90 = quarterTurns % 2 === 1;
+    const effW = isRotated90 ? skImage.height() : skImage.width();
+    const effH = isRotated90 ? skImage.width() : skImage.height();
+
+    if (cropAspect === 'original') {
+      return { x: 0, y: 0, w: effW, h: effH };
+    }
+
+    const targetRatio =
+      cropAspect === '1:1' ? 1 : cropAspect === '4:5' ? 4 / 5 : 16 / 9;
+    const currentRatio = effW / effH;
+
+    let cropW = effW;
+    let cropH = effH;
+    if (currentRatio > targetRatio) {
+      cropW = Math.round(effH * targetRatio);
+    } else {
+      cropH = Math.round(effW / targetRatio);
+    }
+
+    return {
+      x: Math.round((effW - cropW) / 2),
+      y: Math.round((effH - cropH) / 2),
+      w: cropW,
+      h: cropH,
+    };
+  }, [skImage, cropAspect, quarterTurns]);
+
   const canvasDimensions = useMemo(() => {
     const maxWidth = screenWidth - 24;
-    const maxHeight = Math.min(310, Math.round(screenHeight * 0.36));
+    const maxHeight = Math.min(300, Math.round(screenHeight * 0.35));
     if (!skImage) {
-      return { width: maxWidth, height: Math.min(260, maxHeight), nativeScaleRatio: 1 };
+      return { width: maxWidth, height: Math.min(250, maxHeight), nativeScaleRatio: 1 };
     }
-    const imgW = skImage.width();
-    const imgH = skImage.height();
-    const fitScale = Math.min(maxWidth / imgW, maxHeight / imgH);
+    const fitScale = Math.min(maxWidth / cropRect.w, maxHeight / cropRect.h);
     return {
-      width: Math.round(imgW * fitScale),
-      height: Math.round(imgH * fitScale),
+      width: Math.round(cropRect.w * fitScale),
+      height: Math.round(cropRect.h * fitScale),
       nativeScaleRatio: Math.max(1, 1 / fitScale),
     };
-  }, [skImage, screenWidth, screenHeight]);
+  }, [skImage, cropRect, screenWidth, screenHeight]);
 
   const maxZoom = useMemo(() => {
     return Math.max(4, Number((canvasDimensions.nativeScaleRatio * 1.5).toFixed(2)));
@@ -205,9 +390,9 @@ function AstroEditorScreen() {
   const viewportPanResponder = useMemo(
     () =>
       PanResponder.create({
-        onStartShouldSetPanResponder: () => true,
+        onStartShouldSetPanResponder: () => !splitEnabled,
         onMoveShouldSetPanResponder: (_, gs) =>
-          Math.abs(gs.dx) > 2 || Math.abs(gs.dy) > 2 || gs.numberActiveTouches >= 2,
+          !splitEnabled && (Math.abs(gs.dx) > 2 || Math.abs(gs.dy) > 2 || gs.numberActiveTouches >= 2),
         onPanResponderGrant: (evt: GestureResponderEvent) => {
           const touches = evt.nativeEvent.touches;
           gestureStartRef.current = {
@@ -254,7 +439,25 @@ function AstroEditorScreen() {
           gestureStartRef.current.isPinching = false;
         },
       }),
-    [clampPan, maxZoom]
+    [clampPan, maxZoom, splitEnabled]
+  );
+
+  // Split-screen before/after wipe responder
+  const splitStartRef = useRef(0.5);
+  const splitPanResponder = useMemo(
+    () =>
+      PanResponder.create({
+        onStartShouldSetPanResponder: () => true,
+        onMoveShouldSetPanResponder: () => true,
+        onPanResponderGrant: () => {
+          splitStartRef.current = splitRatio;
+        },
+        onPanResponderMove: (_, gs) => {
+          const next = Math.min(0.95, Math.max(0.05, splitStartRef.current + gs.dx / Math.max(1, canvasDimensions.width)));
+          setSplitRatio(next);
+        },
+      }),
+    [splitRatio, canvasDimensions.width]
   );
 
   const pickImage = async () => {
@@ -276,21 +479,20 @@ function AstroEditorScreen() {
   };
 
   const applyPreset = useCallback(
-    (presetId: string) => {
-      if (presetId === 'auto_pro' && skImage) {
+    (preset: AstroPreset) => {
+      if (preset.id === 'auto_pro' && skImage) {
+        const analysis = analyzeAstroImage(skImage);
         setActivePresetId('auto_pro');
-        setParams(computeAutoParams(skImage));
+        setParams(analysis.autoParams);
+        setBgModel(analysis.bgModel);
         setShowOriginal(false);
         setRenderTick((t) => t + 1);
         return;
       }
-      const found = ASTRO_PRESETS.find((p) => p.id === presetId);
-      if (found) {
-        setActivePresetId(found.id);
-        setParams({ ...found.params });
-        setShowOriginal(false);
-        setRenderTick((t) => t + 1);
-      }
+      setActivePresetId(preset.id);
+      setParams({ ...preset.params });
+      setShowOriginal(false);
+      setRenderTick((t) => t + 1);
     },
     [skImage]
   );
@@ -305,97 +507,208 @@ function AstroEditorScreen() {
     setRenderTick((t) => t + 1);
   }, []);
 
-  const exportFullResolution = async () => {
-    if (!skImage || !runtimeEffect) return;
+  const handleSaveCustomPreset = () => {
+    const trimmed = newPresetName.trim();
+    if (!trimmed) {
+      Alert.alert('Name Required', 'Enter a name for your custom preset.');
+      return;
+    }
+    const created: AstroPreset = {
+      id: `custom_${Date.now()}`,
+      name: trimmed,
+      description: 'Saved custom profile',
+      isCustom: true,
+      params: { ...params },
+    };
+    persistCustomPresets([created, ...customPresets]);
+    setActivePresetId(created.id);
+    setNewPresetName('');
+    setSaveModalVisible(false);
+  };
 
-    let step = 'init';
+  const handleDeleteCustomPreset = (preset: AstroPreset) => {
+    if (!preset.isCustom) return;
+    Alert.alert('Delete Preset', `Remove "${preset.name}"?`, [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete',
+        style: 'destructive',
+        onPress: () => {
+          persistCustomPresets(customPresets.filter((p) => p.id !== preset.id));
+          if (activePresetId === preset.id) {
+            setActivePresetId('custom');
+          }
+        },
+      },
+    ]);
+  };
+
+  // Renders full-resolution cropped & rotated output file
+  const renderProcessedFile = async (): Promise<{ uri: string; width: number; height: number }> => {
+    if (!skImage || !runtimeEffect) {
+      throw new Error('Image or shader not ready');
+    }
+
+    const outW = cropRect.w;
+    const outH = cropRect.h;
+
+    const surface = Skia.Surface.MakeOffscreen(outW, outH);
+    if (!surface) {
+      throw new Error('Could not allocate offscreen GPU surface');
+    }
+
+    const imgShader = skImage.makeShaderOptions(
+      TileMode.Clamp,
+      TileMode.Clamp,
+      FilterMode.Linear,
+      MipmapMode.None
+    );
+
+    const uniformValues = [
+      skImage.width(),
+      skImage.height(),
+      params.stretch,
+      params.blackPoint,
+      params.bgExtract,
+      params.scnrGreen,
+      params.waveletFine,
+      params.waveletMed,
+      params.denoise,
+      params.vibrance,
+      params.temperature,
+      params.tint,
+      params.starControl,
+      ...bgModel.tl,
+      ...bgModel.tr,
+      ...bgModel.bl,
+      ...bgModel.br,
+      0.0, // Never bake clipping warning overlay into exported files
+    ];
+
+    const finalShader = runtimeEffect.makeShaderWithChildren(uniformValues, [imgShader]);
+    const canvas = surface.getCanvas();
+    const paint = Skia.Paint();
+    paint.setShader(finalShader);
+
+    // Apply crop offset & rotation transforms in native pixel space
+    canvas.save();
+    canvas.translate(outW / 2, outH / 2);
+    const totalDeg = quarterTurns * 90 + fineAngle;
+    if (totalDeg !== 0) {
+      canvas.rotate(totalDeg, 0, 0);
+      // Slight auto-scale when fine-tilting so corners never show black triangles
+      if (fineAngle !== 0) {
+        const rad = (Math.abs(fineAngle) * Math.PI) / 180;
+        const zoomFill = Math.cos(rad) + Math.sin(rad) * Math.max(outW / outH, outH / outW);
+        canvas.scale(zoomFill, zoomFill);
+      }
+    }
+    canvas.translate(-skImage.width() / 2, -skImage.height() / 2);
+    canvas.drawRect(Skia.XYWHRect(0, 0, skImage.width(), skImage.height()), paint);
+    canvas.restore();
+    surface.flush();
+
+    const snapshot = surface.makeImageSnapshot();
+    const encodedBytes =
+      exportFormat === 'jpeg'
+        ? await Promise.resolve(snapshot.encodeToBytes(ImageFormat.JPEG, 95))
+        : await Promise.resolve(snapshot.encodeToBytes());
+
+    const ext = exportFormat === 'jpeg' ? 'jpg' : 'png';
+    const outFile = new File(Paths.cache, `astro_${Date.now()}.${ext}`);
+    outFile.write(encodedBytes);
+
+    return { uri: outFile.uri, width: outW, height: outH };
+  };
+
+  const handleSaveToGallery = async () => {
     try {
-      setIsSaving(true);
-
-      step = 'requestPermissions';
+      setIsExporting(true);
       const { status } = await MediaLibrary.requestPermissionsAsync(true);
       if (status !== 'granted') {
         Alert.alert('Permission Required', 'Allow photo library access to save your enhanced image.');
-        setIsSaving(false);
         return;
       }
-
-      const fullW = skImage.width();
-      const fullH = skImage.height();
-
-      step = 'makeOffscreenSurface';
-      const surface = Skia.Surface.MakeOffscreen(fullW, fullH);
-      if (!surface) {
-        throw new Error('Could not allocate offscreen GPU surface');
-      }
-
-      step = 'makeImageShader';
-      const imgShader = skImage.makeShaderOptions(
-        TileMode.Clamp,
-        TileMode.Clamp,
-        FilterMode.Linear,
-        MipmapMode.None
-      );
-
-      step = 'makeRuntimeShader';
-      const uniformValues = [
-        fullW,
-        fullH,
-        params.stretch,
-        params.blackPoint,
-        params.sharpen,
-        params.denoise,
-        params.vibrance,
-        params.starControl,
-      ];
-
-      const finalShader = runtimeEffect.makeShaderWithChildren(uniformValues, [imgShader]);
-
-      step = 'drawToCanvas';
-      const canvas = surface.getCanvas();
-      const paint = Skia.Paint();
-      paint.setShader(finalShader);
-
-      canvas.drawRect(Skia.XYWHRect(0, 0, fullW, fullH), paint);
-      surface.flush();
-
-      step = 'encodeSnapshot';
-      const snapshot = surface.makeImageSnapshot();
-      const pngBytes = await Promise.resolve(snapshot.encodeToBytes());
-
-      step = 'writeFile';
-      const outFile = new File(Paths.cache, `astro_enhanced_${Date.now()}.png`);
-      outFile.write(pngBytes);
-
-      step = 'saveToLibrary';
-      await MediaLibrary.saveToLibraryAsync(outFile.uri);
-      Alert.alert('Saved', `Full-resolution (${fullW}x${fullH}) astrophoto saved to your gallery.`);
-    } catch (err) {
+      const { uri, width, height } = await renderProcessedFile();
+      await MediaLibrary.saveToLibraryAsync(uri);
       Alert.alert(
-        'Export Error',
-        `Failed at [${step}]: ${err instanceof Error ? err.message : String(err)}`
+        'Saved',
+        `Full-resolution (${width}x${height} ${exportFormat.toUpperCase()}) saved to your gallery.`
       );
+    } catch (err) {
+      Alert.alert('Save Error', err instanceof Error ? err.message : String(err));
     } finally {
-      setIsSaving(false);
+      setIsExporting(false);
+    }
+  };
+
+  const handleShareImage = async () => {
+    try {
+      setIsExporting(true);
+      const canShare = await Sharing.isAvailableAsync();
+      if (!canShare) {
+        Alert.alert('Unavailable', 'Sharing is not supported on this device.');
+        return;
+      }
+      const { uri } = await renderProcessedFile();
+      await Sharing.shareAsync(uri, {
+        mimeType: exportFormat === 'jpeg' ? 'image/jpeg' : 'image/png',
+        dialogTitle: 'Share Enhanced Astrophoto',
+      });
+    } catch (err) {
+      Alert.alert('Share Error', err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsExporting(false);
     }
   };
 
   const originalPreset = ASTRO_PRESETS[ASTRO_PRESETS.length - 1];
   const activeParams = showOriginal ? originalPreset.params : params;
 
-  const uniforms = {
+  const buildUniformObj = (p: AstroParams, clipFlag: boolean) => ({
     resolution: [canvasDimensions.width, canvasDimensions.height],
-    stretch: activeParams.stretch,
-    blackPoint: activeParams.blackPoint,
-    sharpen: activeParams.sharpen,
-    denoise: activeParams.denoise,
-    vibrance: activeParams.vibrance,
-    starControl: activeParams.starControl,
-  };
+    stretch: p.stretch,
+    blackPoint: p.blackPoint,
+    bgExtract: p.bgExtract,
+    scnrGreen: p.scnrGreen,
+    waveletFine: p.waveletFine,
+    waveletMed: p.waveletMed,
+    denoise: p.denoise,
+    vibrance: p.vibrance,
+    temperature: p.temperature,
+    tint: p.tint,
+    starControl: p.starControl,
+    bgTL: bgModel.tl,
+    bgTR: bgModel.tr,
+    bgBL: bgModel.bl,
+    bgBR: bgModel.br,
+    showClipping: clipFlag ? 1.0 : 0.0,
+  });
+
+  const editedUniforms = buildUniformObj(activeParams, showClipping && !showOriginal);
+  const rawUniforms = buildUniformObj(originalPreset.params, false);
 
   const zoomPercent = skImage
     ? Math.round((zoom / canvasDimensions.nativeScaleRatio) * 100)
     : 100;
+
+  const allPresets = useMemo(() => [...customPresets, ...ASTRO_PRESETS], [customPresets]);
+
+  // Compute preview transform including crop aspect & rotation
+  const totalPreviewDeg = quarterTurns * 90 + fineAngle;
+  const fineFillScale = useMemo(() => {
+    if (fineAngle === 0) return 1;
+    const rad = (Math.abs(fineAngle) * Math.PI) / 180;
+    return Math.cos(rad) + Math.sin(rad) * 1.4;
+  }, [fineAngle]);
+
+  const baseImageScale = useMemo(() => {
+    if (!skImage) return 1;
+    const isRot90 = quarterTurns % 2 === 1;
+    const effW = isRot90 ? skImage.height() : skImage.width();
+    const effH = isRot90 ? skImage.width() : skImage.height();
+    return Math.max(effW / cropRect.w, effH / cropRect.h) * fineFillScale;
+  }, [skImage, quarterTurns, cropRect, fineFillScale]);
 
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
@@ -406,14 +719,14 @@ function AstroEditorScreen() {
         <View style={styles.header}>
           <View style={{ flex: 1, paddingRight: 8 }}>
             <Text style={styles.title}>AstroEnhancer</Text>
-            <Text style={styles.subtitle}>Natural Deep-Sky, Solar, Lunar & Planetary Processor</Text>
+            <Text style={styles.subtitle}>DBE • SCNR • Wavelets • Deep-Sky & Planetary</Text>
           </View>
           <Pressable style={styles.primaryBtn} onPress={pickImage}>
             <Text style={styles.primaryBtnText}>{imageUri ? 'Change Photo' : 'Open Photo'}</Text>
           </Pressable>
         </View>
 
-        <View style={[styles.canvasContainer, { height: canvasDimensions.height + (skImage ? 38 : 0) }]}>
+        <View style={[styles.canvasContainer, { height: canvasDimensions.height + (skImage ? 40 : 0) }]}>
           {skImage && runtimeEffect ? (
             <>
               <View
@@ -423,6 +736,7 @@ function AstroEditorScreen() {
                   { width: canvasDimensions.width, height: canvasDimensions.height },
                 ]}
               >
+                {/* Processed (or Raw Toggle) Layer */}
                 <View
                   style={{
                     width: canvasDimensions.width,
@@ -430,16 +744,17 @@ function AstroEditorScreen() {
                     transform: [
                       { translateX: pan.x },
                       { translateY: pan.y },
-                      { scale: zoom },
+                      { scale: zoom * baseImageScale },
+                      { rotate: `${totalPreviewDeg}deg` },
                     ],
                   }}
                 >
                   <Canvas
-                    key={`canvas-${renderTick}-${showOriginal ? 'orig' : 'edit'}`}
+                    key={`canvas-${renderTick}-${showOriginal ? 'orig' : 'edit'}-${showClipping ? 'clip' : 'noclip'}`}
                     style={{ width: canvasDimensions.width, height: canvasDimensions.height }}
                   >
                     <Fill>
-                      <Shader source={runtimeEffect} uniforms={uniforms}>
+                      <Shader source={runtimeEffect} uniforms={editedUniforms}>
                         <ImageShader
                           image={skImage}
                           fit="contain"
@@ -454,27 +769,133 @@ function AstroEditorScreen() {
                     </Fill>
                   </Canvas>
                 </View>
+
+                {/* Split-Screen Raw Overlay (Left Side) */}
+                {splitEnabled && (
+                  <View
+                    pointerEvents="none"
+                    style={{
+                      position: 'absolute',
+                      left: 0,
+                      top: 0,
+                      bottom: 0,
+                      width: canvasDimensions.width * splitRatio,
+                      overflow: 'hidden',
+                    }}
+                  >
+                    <View
+                      style={{
+                        width: canvasDimensions.width,
+                        height: canvasDimensions.height,
+                        transform: [
+                          { translateX: pan.x },
+                          { translateY: pan.y },
+                          { scale: zoom * baseImageScale },
+                          { rotate: `${totalPreviewDeg}deg` },
+                        ],
+                      }}
+                    >
+                      <Canvas style={{ width: canvasDimensions.width, height: canvasDimensions.height }}>
+                        <Fill>
+                          <Shader source={runtimeEffect} uniforms={rawUniforms}>
+                            <ImageShader
+                              image={skImage}
+                              fit="contain"
+                              rect={{
+                                x: 0,
+                                y: 0,
+                                width: canvasDimensions.width,
+                                height: canvasDimensions.height,
+                              }}
+                            />
+                          </Shader>
+                        </Fill>
+                      </Canvas>
+                    </View>
+                  </View>
+                )}
+
+                {/* Draggable Split Wipe Handle */}
+                {splitEnabled && (
+                  <View
+                    {...splitPanResponder.panHandlers}
+                    style={[
+                      styles.splitLineWrap,
+                      { left: canvasDimensions.width * splitRatio - 16 },
+                    ]}
+                  >
+                    <View style={styles.splitLine} />
+                    <View style={styles.splitHandle}>
+                      <Text style={styles.splitHandleText}>◀▶</Text>
+                    </View>
+                  </View>
+                )}
+
+                {/* Live RGB Histogram HUD */}
+                {showHistogram && histData && (
+                  <View pointerEvents="none" style={styles.histBox}>
+                    <View style={styles.histBars}>
+                      {histData.r.map((_, i) => (
+                        <View key={i} style={styles.histCol}>
+                          <View style={[styles.histBar, { height: Math.max(2, histData.b[i] * 34), backgroundColor: 'rgba(56,189,248,0.65)' }]} />
+                          <View style={[styles.histBar, { height: Math.max(2, histData.g[i] * 34), backgroundColor: 'rgba(74,222,128,0.55)' }]} />
+                          <View style={[styles.histBar, { height: Math.max(2, histData.r[i] * 34), backgroundColor: 'rgba(248,113,113,0.55)' }]} />
+                        </View>
+                      ))}
+                    </View>
+                    <Text style={styles.histLabel}>RGB HISTOGRAM</Text>
+                  </View>
+                )}
               </View>
 
+              {/* Viewport HUD Bar */}
               <View style={styles.viewportBar}>
-                <Pressable
-                  style={[styles.barChip, showOriginal && styles.barChipWarn]}
-                  onPress={() => {
-                    setShowOriginal((v) => !v);
-                    setRenderTick((t) => t + 1);
-                  }}
-                >
-                  <Text style={styles.barChipText}>
-                    {showOriginal ? 'Showing: Raw' : 'Compare Raw'}
-                  </Text>
-                </Pressable>
+                <View style={styles.zoomGroup}>
+                  <Pressable
+                    style={[styles.barChip, showOriginal && styles.barChipWarn]}
+                    onPress={() => {
+                      setSplitEnabled(false);
+                      setShowOriginal((v) => !v);
+                      setRenderTick((t) => t + 1);
+                    }}
+                  >
+                    <Text style={styles.barChipText}>{showOriginal ? 'Raw' : 'Compare'}</Text>
+                  </Pressable>
+
+                  <Pressable
+                    style={[styles.barChip, { marginLeft: 5 }, splitEnabled && styles.barChipActive]}
+                    onPress={() => {
+                      setShowOriginal(false);
+                      setSplitEnabled((v) => !v);
+                    }}
+                  >
+                    <Text style={styles.barChipText}>Split</Text>
+                  </Pressable>
+
+                  <Pressable
+                    style={[styles.barChip, { marginLeft: 5 }, showHistogram && styles.barChipActive]}
+                    onPress={() => setShowHistogram((v) => !v)}
+                  >
+                    <Text style={styles.barChipText}>Hist</Text>
+                  </Pressable>
+
+                  <Pressable
+                    style={[styles.barChip, { marginLeft: 5 }, showClipping && styles.barChipWarn]}
+                    onPress={() => {
+                      setShowClipping((v) => !v);
+                      setRenderTick((t) => t + 1);
+                    }}
+                  >
+                    <Text style={styles.barChipText}>Clip</Text>
+                  </Pressable>
+                </View>
 
                 <View style={styles.zoomGroup}>
                   <Pressable style={styles.barChip} onPress={zoomToNative100}>
-                    <Text style={styles.barChipText}>100% Native ({zoomPercent}%)</Text>
+                    <Text style={styles.barChipText}>{zoomPercent}%</Text>
                   </Pressable>
                   {zoom > 1.02 && (
-                    <Pressable style={[styles.barChip, { marginLeft: 6 }]} onPress={resetZoom}>
+                    <Pressable style={[styles.barChip, { marginLeft: 5 }]} onPress={resetZoom}>
                       <Text style={styles.barChipText}>Fit</Text>
                     </Pressable>
                   )}
@@ -485,107 +906,306 @@ function AstroEditorScreen() {
             <Pressable style={styles.emptyState} onPress={pickImage}>
               <Text style={styles.emptyTitle}>Tap to Load Astrophoto</Text>
               <Text style={styles.emptyDesc}>
-                Pinch to zoom up to full native resolution • Dedicated profiles for Nebula, Galaxies, Moon, Sun & Planets
+                Dynamic Background Extraction • Green Cast SCNR • Multi-Scale Wavelets • Crop & Rotate
               </Text>
             </Pressable>
           )}
         </View>
       </View>
 
-      {/* MIDDLE SCROLLABLE AREA: Presets & Fine-Tune Sliders */}
+      {/* MIDDLE SCROLLABLE AREA WITH TABS */}
       {skImage ? (
         <>
-          <ScrollView
-            style={styles.middleScroll}
-            contentContainerStyle={styles.middleScrollContent}
-          >
-            <Text style={styles.sectionTitle}>Enhancement Profiles</Text>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.presetRow}>
-              {ASTRO_PRESETS.map((preset) => {
-                const isSelected = activePresetId === preset.id && !showOriginal;
-                return (
-                  <Pressable
-                    key={preset.id}
-                    style={[styles.presetCard, isSelected && styles.presetCardActive]}
-                    onPress={() => applyPreset(preset.id)}
-                  >
-                    <Text style={[styles.presetName, isSelected && styles.presetNameActive]}>
-                      {preset.name}
-                    </Text>
-                    <Text style={styles.presetDesc}>{preset.description}</Text>
-                  </Pressable>
-                );
-              })}
-            </ScrollView>
+          {/* Tab Switcher */}
+          <View style={styles.tabBar}>
+            <Pressable
+              style={[styles.tabBtn, activeTab === 'tune' && styles.tabBtnActive]}
+              onPress={() => setActiveTab('tune')}
+            >
+              <Text style={[styles.tabText, activeTab === 'tune' && styles.tabTextActive]}>
+                Astro Pipeline
+              </Text>
+            </Pressable>
+            <Pressable
+              style={[styles.tabBtn, activeTab === 'presets' && styles.tabBtnActive]}
+              onPress={() => setActiveTab('presets')}
+            >
+              <Text style={[styles.tabText, activeTab === 'presets' && styles.tabTextActive]}>
+                Profiles ({allPresets.length})
+              </Text>
+            </Pressable>
+            <Pressable
+              style={[styles.tabBtn, activeTab === 'crop' && styles.tabBtnActive]}
+              onPress={() => setActiveTab('crop')}
+            >
+              <Text style={[styles.tabText, activeTab === 'crop' && styles.tabTextActive]}>
+                Crop & Rotate
+              </Text>
+            </Pressable>
+          </View>
 
-            <Text style={styles.sectionTitle}>Fine-Tune Pipeline</Text>
-            <View style={styles.controlsCard}>
-              <SliderRow
-                label="Detail Stretch (Faint Gas & Dust)"
-                value={params.stretch}
-                min={0}
-                max={1}
-                onChange={(v) => updateParamValue('stretch', v)}
-              />
-              <SliderRow
-                label="Sky Background Floor"
-                value={params.blackPoint}
-                min={0}
-                max={0.35}
-                onChange={(v) => updateParamValue('blackPoint', v)}
-              />
-              <SliderRow
-                label="Star Control & White Cores"
-                value={params.starControl}
-                min={0}
-                max={1}
-                onChange={(v) => updateParamValue('starControl', v)}
-              />
-              <SliderRow
-                label="Structure & Surface Sharpen"
-                value={params.sharpen}
-                min={0}
-                max={1.5}
-                onChange={(v) => updateParamValue('sharpen', v)}
-              />
-              <SliderRow
-                label="Natural Midtone Color"
-                value={params.vibrance}
-                min={0}
-                max={1.5}
-                onChange={(v) => updateParamValue('vibrance', v)}
-              />
-              <SliderRow
-                label="Hot-Pixel & Chroma Denoise"
-                value={params.denoise}
-                min={0}
-                max={1}
-                isLast
-                onChange={(v) => updateParamValue('denoise', v)}
-              />
-            </View>
+          <ScrollView style={styles.middleScroll} contentContainerStyle={styles.middleScrollContent}>
+            {activeTab === 'presets' && (
+              <>
+                <View style={styles.presetHeaderRow}>
+                  <Text style={styles.sectionTitle}>Target & Saved Profiles</Text>
+                  <Pressable style={styles.savePresetChip} onPress={() => setSaveModalVisible(true)}>
+                    <Text style={styles.savePresetChipText}>+ Save Current</Text>
+                  </Pressable>
+                </View>
+                <View style={styles.presetGrid}>
+                  {allPresets.map((preset) => {
+                    const isSelected = activePresetId === preset.id && !showOriginal;
+                    return (
+                      <Pressable
+                        key={preset.id}
+                        style={[styles.presetGridCard, isSelected && styles.presetCardActive]}
+                        onPress={() => applyPreset(preset)}
+                        onLongPress={() => handleDeleteCustomPreset(preset)}
+                      >
+                        <Text style={[styles.presetName, isSelected && styles.presetNameActive]}>
+                          {preset.isCustom ? `★ ${preset.name}` : preset.name}
+                        </Text>
+                        <Text style={styles.presetDesc}>{preset.description}</Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+              </>
+            )}
+
+            {activeTab === 'tune' && (
+              <View style={styles.controlsCard}>
+                <SliderRow
+                  label="Detail Stretch (Asinh)"
+                  value={params.stretch}
+                  min={0}
+                  max={1}
+                  onChange={(v) => updateParamValue('stretch', v)}
+                />
+                <SliderRow
+                  label="Sky Background Floor"
+                  value={params.blackPoint}
+                  min={0}
+                  max={0.35}
+                  onChange={(v) => updateParamValue('blackPoint', v)}
+                />
+                <SliderRow
+                  label="Gradient Removal (DBE)"
+                  value={params.bgExtract}
+                  min={0}
+                  max={1}
+                  onChange={(v) => updateParamValue('bgExtract', v)}
+                />
+                <SliderRow
+                  label="Green Cast Removal (SCNR)"
+                  value={params.scnrGreen}
+                  min={0}
+                  max={1}
+                  onChange={(v) => updateParamValue('scnrGreen', v)}
+                />
+                <SliderRow
+                  label="Star Control & White Cores"
+                  value={params.starControl}
+                  min={0}
+                  max={1}
+                  onChange={(v) => updateParamValue('starControl', v)}
+                />
+                <SliderRow
+                  label="Wavelet Sharpen (Fine)"
+                  value={params.waveletFine}
+                  min={0}
+                  max={1.5}
+                  onChange={(v) => updateParamValue('waveletFine', v)}
+                />
+                <SliderRow
+                  label="Wavelet Structure (Medium)"
+                  value={params.waveletMed}
+                  min={0}
+                  max={1.5}
+                  onChange={(v) => updateParamValue('waveletMed', v)}
+                />
+                <SliderRow
+                  label="Natural Midtone Vibrance"
+                  value={params.vibrance}
+                  min={0}
+                  max={1.5}
+                  onChange={(v) => updateParamValue('vibrance', v)}
+                />
+                <SliderRow
+                  label="White Balance (Cool ↔ Warm)"
+                  value={params.temperature}
+                  min={-0.5}
+                  max={0.5}
+                  signed
+                  onChange={(v) => updateParamValue('temperature', v)}
+                />
+                <SliderRow
+                  label="Tint (Green ↔ Magenta)"
+                  value={params.tint}
+                  min={-0.5}
+                  max={0.5}
+                  signed
+                  onChange={(v) => updateParamValue('tint', v)}
+                />
+                <SliderRow
+                  label="Hot-Pixel & Chroma Denoise"
+                  value={params.denoise}
+                  min={0}
+                  max={1}
+                  isLast
+                  onChange={(v) => updateParamValue('denoise', v)}
+                />
+              </View>
+            )}
+
+            {activeTab === 'crop' && (
+              <View style={styles.controlsCard}>
+                <Text style={styles.cropSectionLabel}>Aspect Ratio</Text>
+                <View style={styles.aspectRow}>
+                  {(['original', '1:1', '4:5', '16:9'] as CropAspect[]).map((asp) => (
+                    <Pressable
+                      key={asp}
+                      style={[styles.aspectChip, cropAspect === asp && styles.aspectChipActive]}
+                      onPress={() => {
+                        setCropAspect(asp);
+                        resetZoom();
+                      }}
+                    >
+                      <Text
+                        style={[
+                          styles.aspectChipText,
+                          cropAspect === asp && styles.aspectChipTextActive,
+                        ]}
+                      >
+                        {asp === 'original' ? 'Original' : asp}
+                      </Text>
+                    </Pressable>
+                  ))}
+                </View>
+
+                <Text style={[styles.cropSectionLabel, { marginTop: 12 }]}>Orientation</Text>
+                <View style={styles.aspectRow}>
+                  <Pressable
+                    style={styles.aspectChip}
+                    onPress={() => {
+                      setQuarterTurns((q) => (q + 3) % 4);
+                      resetZoom();
+                    }}
+                  >
+                    <Text style={styles.aspectChipText}>↺ Rotate -90°</Text>
+                  </Pressable>
+                  <Pressable
+                    style={styles.aspectChip}
+                    onPress={() => {
+                      setQuarterTurns((q) => (q + 1) % 4);
+                      resetZoom();
+                    }}
+                  >
+                    <Text style={styles.aspectChipText}>↻ Rotate +90°</Text>
+                  </Pressable>
+                  <Pressable
+                    style={styles.aspectChip}
+                    onPress={() => {
+                      setCropAspect('original');
+                      setQuarterTurns(0);
+                      setFineAngle(0);
+                      resetZoom();
+                    }}
+                  >
+                    <Text style={styles.aspectChipText}>Reset All</Text>
+                  </Pressable>
+                </View>
+
+                <SliderRow
+                  label="Fine Tilt / Leveling Angle"
+                  value={fineAngle}
+                  min={-15}
+                  max={15}
+                  unit="°"
+                  isLast
+                  onChange={(v) => setFineAngle(Number(v.toFixed(1)))}
+                />
+              </View>
+            )}
           </ScrollView>
 
-          {/* PINNED BOTTOM: Save Full-Resolution Button */}
+          {/* PINNED BOTTOM: Format Toggle + Save + Share */}
           <View style={[styles.pinnedBottom, { paddingBottom: Math.max(12, insets.bottom + 8) }]}>
-            <Pressable
-              style={[styles.exportBtn, isSaving && styles.exportBtnDisabled]}
-              onPress={exportFullResolution}
-              disabled={isSaving}
-            >
-              {isSaving ? (
-                <ActivityIndicator color="#0B0F19" />
-              ) : (
-                <Text style={styles.exportBtnText}>
-                  Save Full-Resolution Image ({skImage.width()}x{skImage.height()})
-                </Text>
-              )}
-            </Pressable>
+            <View style={styles.bottomRow}>
+              {/* PNG / JPEG Pill */}
+              <Pressable
+                style={styles.formatBtn}
+                onPress={() => setExportFormat((f) => (f === 'png' ? 'jpeg' : 'png'))}
+              >
+                <Text style={styles.formatBtnText}>{exportFormat.toUpperCase()}</Text>
+              </Pressable>
+
+              {/* Main Save Button */}
+              <Pressable
+                style={[styles.exportBtn, isExporting && styles.exportBtnDisabled]}
+                onPress={handleSaveToGallery}
+                disabled={isExporting}
+              >
+                {isExporting ? (
+                  <ActivityIndicator color="#070A12" />
+                ) : (
+                  <Text style={styles.exportBtnText}>
+                    Save ({cropRect.w}×{cropRect.h})
+                  </Text>
+                )}
+              </Pressable>
+
+              {/* Share Button */}
+              <Pressable
+                style={[styles.shareBtn, isExporting && styles.exportBtnDisabled]}
+                onPress={handleShareImage}
+                disabled={isExporting}
+              >
+                <Text style={styles.shareBtnText}>Share</Text>
+              </Pressable>
+            </View>
           </View>
         </>
       ) : (
         <View style={{ flex: 1 }} />
       )}
+
+      {/* Save Custom Preset Modal */}
+      <Modal
+        visible={saveModalVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setSaveModalVisible(false)}
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Save Custom Preset</Text>
+            <Text style={styles.modalSub}>
+              Save your current slider settings for future astrophotos.
+            </Text>
+            <TextInput
+              style={styles.modalInput}
+              placeholder="e.g., Seestar Nebula or Moon Sharp"
+              placeholderTextColor="#64748B"
+              value={newPresetName}
+              onChangeText={setNewPresetName}
+              autoFocus
+            />
+            <View style={styles.modalActions}>
+              <Pressable
+                style={styles.modalCancelBtn}
+                onPress={() => setSaveModalVisible(false)}
+              >
+                <Text style={styles.modalCancelText}>Cancel</Text>
+              </Pressable>
+              <Pressable style={styles.modalSaveBtn} onPress={handleSaveCustomPreset}>
+                <Text style={styles.modalSaveText}>Save Preset</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -595,6 +1215,8 @@ function SliderRow({
   value,
   min,
   max,
+  signed = false,
+  unit = '%',
   isLast = false,
   onChange,
 }: {
@@ -602,6 +1224,8 @@ function SliderRow({
   value: number;
   min: number;
   max: number;
+  signed?: boolean;
+  unit?: string;
   isLast?: boolean;
   onChange: (val: number) => void;
 }) {
@@ -642,11 +1266,19 @@ function SliderRow({
     trackWidthRef.current = e.nativeEvent.layout.width;
   };
 
+  let displayVal = `${Math.round(ratio * 100)}%`;
+  if (unit === '°') {
+    displayVal = `${value > 0 ? '+' : ''}${value.toFixed(1)}°`;
+  } else if (signed) {
+    const pct = Math.round((value / max) * 100);
+    displayVal = `${pct > 0 ? '+' : ''}${pct}%`;
+  }
+
   return (
     <View style={[styles.sliderRow, isLast && { borderBottomWidth: 0 }]}>
       <View style={styles.sliderHeader}>
         <Text style={styles.controlLabel}>{label}</Text>
-        <Text style={styles.stepVal}>{Math.round(ratio * 100)}%</Text>
+        <Text style={styles.stepVal}>{displayVal}</Text>
       </View>
       <View
         style={styles.sliderTouchArea}
@@ -669,8 +1301,8 @@ const styles = StyleSheet.create({
   },
   pinnedTop: {
     paddingHorizontal: 12,
-    paddingTop: 8,
-    paddingBottom: 10,
+    paddingTop: 6,
+    paddingBottom: 8,
     backgroundColor: '#070A12',
     borderBottomWidth: 1,
     borderBottomColor: '#1E293B',
@@ -679,10 +1311,10 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 10,
+    marginBottom: 8,
   },
   title: {
-    fontSize: 20,
+    fontSize: 19,
     fontWeight: '700',
     color: '#F8FAFC',
   },
@@ -696,7 +1328,7 @@ const styles = StyleSheet.create({
     borderColor: '#38BDF8',
     borderWidth: 1,
     paddingHorizontal: 12,
-    paddingVertical: 7,
+    paddingVertical: 6,
     borderRadius: 8,
   },
   primaryBtnText: {
@@ -717,10 +1349,71 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
     backgroundColor: '#05070D',
   },
+  splitLineWrap: {
+    position: 'absolute',
+    top: 0,
+    bottom: 0,
+    width: 32,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  splitLine: {
+    position: 'absolute',
+    top: 0,
+    bottom: 0,
+    width: 2,
+    backgroundColor: '#38BDF8',
+  },
+  splitHandle: {
+    backgroundColor: '#0F172A',
+    borderColor: '#38BDF8',
+    borderWidth: 1.5,
+    paddingHorizontal: 5,
+    paddingVertical: 3,
+    borderRadius: 10,
+  },
+  splitHandleText: {
+    color: '#F8FAFC',
+    fontSize: 9,
+    fontWeight: '700',
+  },
+  histBox: {
+    position: 'absolute',
+    top: 8,
+    right: 8,
+    backgroundColor: 'rgba(7, 10, 18, 0.82)',
+    borderColor: '#1E293B',
+    borderWidth: 1,
+    borderRadius: 6,
+    padding: 5,
+  },
+  histBars: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    height: 34,
+    gap: 1,
+  },
+  histCol: {
+    width: 2.5,
+    height: 34,
+    justifyContent: 'flex-end',
+  },
+  histBar: {
+    position: 'absolute',
+    bottom: 0,
+    width: 2.5,
+  },
+  histLabel: {
+    color: '#94A3B8',
+    fontSize: 8,
+    fontWeight: '700',
+    marginTop: 2,
+    textAlign: 'center',
+  },
   viewportBar: {
     width: '100%',
-    height: 38,
-    paddingHorizontal: 10,
+    height: 40,
+    paddingHorizontal: 8,
     backgroundColor: '#0B111E',
     borderTopWidth: 1,
     borderTopColor: '#1E293B',
@@ -734,12 +1427,15 @@ const styles = StyleSheet.create({
   },
   barChip: {
     backgroundColor: '#1E293B',
-    paddingHorizontal: 9,
-    paddingVertical: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 5,
     borderRadius: 6,
   },
+  barChipActive: {
+    backgroundColor: '#0284C7',
+  },
   barChipWarn: {
-    backgroundColor: '#7C2D12',
+    backgroundColor: '#9A3412',
   },
   barChipText: {
     color: '#E2E8F0',
@@ -762,31 +1458,76 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     lineHeight: 18,
   },
+  tabBar: {
+    flexDirection: 'row',
+    backgroundColor: '#0B111E',
+    borderBottomWidth: 1,
+    borderBottomColor: '#1E293B',
+    paddingHorizontal: 12,
+  },
+  tabBtn: {
+    flex: 1,
+    paddingVertical: 10,
+    alignItems: 'center',
+    borderBottomWidth: 2,
+    borderBottomColor: 'transparent',
+  },
+  tabBtnActive: {
+    borderBottomColor: '#38BDF8',
+  },
+  tabText: {
+    color: '#94A3B8',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  tabTextActive: {
+    color: '#38BDF8',
+  },
   middleScroll: {
     flex: 1,
   },
   middleScrollContent: {
     paddingHorizontal: 14,
     paddingTop: 12,
-    paddingBottom: 20,
+    paddingBottom: 24,
+  },
+  presetHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 10,
   },
   sectionTitle: {
     color: '#E2E8F0',
     fontSize: 14,
     fontWeight: '600',
-    marginBottom: 8,
   },
-  presetRow: {
-    marginBottom: 16,
+  savePresetChip: {
+    backgroundColor: '#132238',
+    borderColor: '#38BDF8',
+    borderWidth: 1,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 6,
   },
-  presetCard: {
-    width: 150,
+  savePresetChipText: {
+    color: '#38BDF8',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  presetGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'space-between',
+  },
+  presetGridCard: {
+    width: '48.5%',
     backgroundColor: '#0F172A',
     borderWidth: 1,
     borderColor: '#1E293B',
     borderRadius: 10,
     padding: 10,
-    marginRight: 10,
+    marginBottom: 10,
   },
   presetCardActive: {
     borderColor: '#38BDF8',
@@ -812,7 +1553,39 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#1E293B',
     paddingHorizontal: 14,
-    paddingVertical: 4,
+    paddingVertical: 6,
+  },
+  cropSectionLabel: {
+    color: '#94A3B8',
+    fontSize: 12,
+    fontWeight: '600',
+    marginTop: 6,
+    marginBottom: 8,
+  },
+  aspectRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  aspectChip: {
+    backgroundColor: '#1E293B',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#334155',
+  },
+  aspectChipActive: {
+    backgroundColor: '#132238',
+    borderColor: '#38BDF8',
+  },
+  aspectChipText: {
+    color: '#CBD5E1',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  aspectChipTextActive: {
+    color: '#38BDF8',
   },
   sliderRow: {
     paddingVertical: 9,
@@ -860,13 +1633,33 @@ const styles = StyleSheet.create({
     marginLeft: -9,
   },
   pinnedBottom: {
-    paddingHorizontal: 14,
+    paddingHorizontal: 12,
     paddingTop: 10,
     backgroundColor: '#070A12',
     borderTopWidth: 1,
     borderTopColor: '#1E293B',
   },
+  bottomRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  formatBtn: {
+    backgroundColor: '#1E293B',
+    borderColor: '#334155',
+    borderWidth: 1,
+    paddingHorizontal: 12,
+    paddingVertical: 13,
+    borderRadius: 10,
+    alignItems: 'center',
+  },
+  formatBtnText: {
+    color: '#E2E8F0',
+    fontWeight: '700',
+    fontSize: 12,
+  },
   exportBtn: {
+    flex: 1,
     backgroundColor: '#38BDF8',
     paddingVertical: 13,
     borderRadius: 10,
@@ -878,6 +1671,80 @@ const styles = StyleSheet.create({
   exportBtnText: {
     color: '#070A12',
     fontWeight: '700',
-    fontSize: 15,
+    fontSize: 14,
+  },
+  shareBtn: {
+    backgroundColor: '#1E293B',
+    borderColor: '#38BDF8',
+    borderWidth: 1,
+    paddingHorizontal: 14,
+    paddingVertical: 13,
+    borderRadius: 10,
+    alignItems: 'center',
+  },
+  shareBtnText: {
+    color: '#38BDF8',
+    fontWeight: '700',
+    fontSize: 13,
+  },
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.72)',
+    justifyContent: 'center',
+    padding: 20,
+  },
+  modalCard: {
+    backgroundColor: '#0F172A',
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#1E293B',
+    padding: 18,
+  },
+  modalTitle: {
+    color: '#F8FAFC',
+    fontSize: 17,
+    fontWeight: '700',
+    marginBottom: 4,
+  },
+  modalSub: {
+    color: '#94A3B8',
+    fontSize: 12,
+    marginBottom: 14,
+  },
+  modalInput: {
+    backgroundColor: '#070A12',
+    borderColor: '#334155',
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    color: '#F8FAFC',
+    fontSize: 14,
+    marginBottom: 16,
+  },
+  modalActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 10,
+  },
+  modalCancelBtn: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 8,
+    backgroundColor: '#1E293B',
+  },
+  modalCancelText: {
+    color: '#CBD5E1',
+    fontWeight: '600',
+  },
+  modalSaveBtn: {
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 8,
+    backgroundColor: '#38BDF8',
+  },
+  modalSaveText: {
+    color: '#070A12',
+    fontWeight: '700',
   },
 });
