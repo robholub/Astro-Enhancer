@@ -38,7 +38,7 @@ export const ASTRO_PRESETS: AstroPreset[] = [
   {
     id: 'auto_pro',
     name: 'Auto Pro',
-    description: 'Auto DBE gradient removal, histogram stretch & balanced stars',
+    description: 'Auto DBE gradient removal, histogram stretch & natural stars',
     params: {
       stretch: 0.45,
       blackPoint: 0.05,
@@ -46,17 +46,17 @@ export const ASTRO_PRESETS: AstroPreset[] = [
       scnrGreen: 0.5,
       waveletFine: 0.4,
       waveletMed: 0.3,
-      denoise: 0.72,
+      denoise: 0.65,
       vibrance: 0.42,
       temperature: 0.0,
       tint: 0.0,
-      starControl: 0.75,
+      starControl: 0.35,
     },
   },
   {
     id: 'nebula',
     name: 'Nebula',
-    description: 'Deep H-alpha/OIII stretch with gradient subtraction & star control',
+    description: 'Deep H-alpha/OIII stretch with gradient subtraction & crisp stars',
     params: {
       stretch: 0.65,
       blackPoint: 0.07,
@@ -64,11 +64,11 @@ export const ASTRO_PRESETS: AstroPreset[] = [
       scnrGreen: 0.65,
       waveletFine: 0.35,
       waveletMed: 0.4,
-      denoise: 0.8,
+      denoise: 0.7,
       vibrance: 0.6,
       temperature: 0.04,
       tint: 0.03,
-      starControl: 0.82,
+      starControl: 0.45,
     },
   },
   {
@@ -82,11 +82,11 @@ export const ASTRO_PRESETS: AstroPreset[] = [
       scnrGreen: 0.75,
       waveletFine: 0.45,
       waveletMed: 0.45,
-      denoise: 0.78,
+      denoise: 0.7,
       vibrance: 0.38,
       temperature: 0.02,
       tint: 0.0,
-      starControl: 0.78,
+      starControl: 0.4,
     },
   },
   {
@@ -163,7 +163,7 @@ export const ASTRO_PRESETS: AstroPreset[] = [
   },
 ];
 
-// GPU Runtime Shader (SkSL) - Full Astro Suite (DBE, SCNR, Wavelets, WB, Cosmetic Correction)
+// GPU Runtime Shader (SkSL) - Star-Preserving Cosmetic Correction + Astro Pipeline
 export const ASTRO_SKSL_SHADER = `
 uniform shader image;
 uniform float2 resolution;
@@ -198,7 +198,7 @@ half4 main(float2 xy) {
   half4 center = image.eval(xy);
   float3 rgb = float3(center.rgb);
 
-  // Sample 3x3 fine scale + 5x5 medium scale for multi-scale wavelets & cosmetic correction
+  // Sample 3x3 fine scale + 5x5 medium scale
   float3 n  = float3(image.eval(xy + float2( 0.0, -1.0)).rgb);
   float3 s  = float3(image.eval(xy + float2( 0.0,  1.0)).rgb);
   float3 e  = float3(image.eval(xy + float2( 1.0,  0.0)).rgb);
@@ -217,31 +217,34 @@ half4 main(float2 xy) {
   float3 sw2 = float3(image.eval(xy + float2(-2.0,  2.0)).rgb);
   float3 se2 = float3(image.eval(xy + float2( 2.0,  2.0)).rgb);
 
-  // Wavelet Scale 1 (Fine 1px blur) & Wavelet Scale 2 (Medium 2.5px blur)
   float3 scale1 = (n + s + e + w) * 0.15 + (nw + ne + sw + se) * 0.10;
   float3 ring2 = (n2 + s2 + e2 + w2) * 0.15 + (nw2 + ne2 + sw2 + se2) * 0.10;
   float3 scale2 = scale1 * 0.5 + ring2 * 0.5;
 
-  // 1. Single-Pixel Hot Pixel & Cold Pixel Cosmetic Rejection
   float3 maxNeighbor = max(max(max(n, s), max(e, w)), max(max(nw, ne), max(sw, se)));
   float3 minNeighbor = min(min(min(n, s), min(e, w)), min(min(nw, ne), min(sw, se)));
 
+  // 1. Chroma-Only Hot Pixel Rejection (Preserves all real broadband stars!)
+  // Real stars brighten R, G, and B together; hot pixels spike in a single isolated color channel.
   if (denoise > 0.001) {
-    float3 clampedRgb = clamp(rgb, minNeighbor * 0.85, maxNeighbor * 1.12);
-    float3 neighborSpan = max(maxNeighbor - minNeighbor, float3(0.015));
-    float3 outlierScore = max(float3(0.0), rgb - maxNeighbor) / neighborSpan;
-    float hotMask = clamp(max(outlierScore.r, max(outlierScore.g, outlierScore.b)) * 0.75, 0.0, 1.0);
-    rgb = mix(rgb, mix(clampedRgb, scale1, hotMask), clamp(denoise * 1.25, 0.0, 1.0));
+    float maxC = max(rgb.r, max(rgb.g, rgb.b));
+    float minC = min(rgb.r, min(rgb.g, rgb.b));
+    float midC = rgb.r + rgb.g + rgb.b - maxC - minC;
+    // High single-channel purity (maxC >> midC) + isolated above 3x3 neighbors = sensor hot pixel
+    float singleChannelPurity = clamp((maxC - midC) / max(maxC, 0.02), 0.0, 1.0);
+    float neighborMaxMax = max(maxNeighbor.r, max(maxNeighbor.g, maxNeighbor.b));
+    float isolatedSpike = smoothstep(0.04, 0.16, maxC - neighborMaxMax);
+    float hotPixelMask = smoothstep(0.55, 0.85, singleChannelPurity) * isolatedSpike;
+    rgb = mix(rgb, scale1, hotPixelMask * clamp(denoise * 1.3, 0.0, 1.0));
   }
 
-  // 2. Dynamic Background Extraction (DBE - 2D Bilinear Sky Gradient Subtraction)
+  // 2. Dynamic Background Extraction (DBE)
   if (bgExtract > 0.001) {
     float2 uv = clamp(xy / max(resolution, float2(1.0)), 0.0, 1.0);
     float3 topGrad = mix(bgTL, bgTR, uv.x);
     float3 botGrad = mix(bgBL, bgBR, uv.x);
     float3 skyModel = mix(topGrad, botGrad, uv.y);
     float3 minCorner = min(min(bgTL, bgTR), min(bgBL, bgBR));
-    // Subtract only the uneven gradient excess above the darkest sky corner
     float3 excessGrad = max(float3(0.0), skyModel - minCorner);
     rgb = max(rgb - excessGrad * bgExtract * 1.15, float3(0.0));
   }
@@ -250,45 +253,45 @@ half4 main(float2 xy) {
   float scale1Luma = getLuma(scale1);
   float scale2Luma = getLuma(scale2);
 
-  // 3. Wide Chroma Blotch Suppression
+  // Star detection (both bright stars and faint pinpoint stars)
+  float localPeak = max(0.0, luma - scale1Luma);
+  float starMask = clamp(smoothstep(0.025, 0.14, localPeak) + smoothstep(0.68, 0.92, luma), 0.0, 1.0);
+
+  // 3. Wide Chroma Blotch Suppression (Masked off stars so star colors stay intact)
   float3 centerChroma = rgb - float3(luma);
   float3 wideChroma = scale2 - float3(scale2Luma);
   float chromaDiff = length(centerChroma - wideChroma);
-  float chromaSuppress = clamp(denoise * 0.9 + smoothstep(0.025, 0.12, chromaDiff) * 0.65, 0.0, 0.96);
-  chromaSuppress *= (1.0 - smoothstep(0.45, 0.78, luma));
+  float chromaSuppress = clamp(denoise * 0.85 + smoothstep(0.03, 0.13, chromaDiff) * 0.6, 0.0, 0.94);
+  chromaSuppress *= (1.0 - smoothstep(0.45, 0.78, luma)) * (1.0 - starMask * 0.85);
   rgb = max(float3(luma) + mix(centerChroma, wideChroma, chromaSuppress), float3(0.0));
 
-  // Star detection
-  float localPeak = max(0.0, luma - scale1Luma);
-  float starMask = clamp(smoothstep(0.05, 0.24, localPeak) + smoothstep(0.72, 0.95, luma), 0.0, 1.0);
-
-  // 4. Luminance-Based Star Tightening
+  // 4. Gentle Outer Halo Tightening (Only affects outer skirts of large bright stars, never erases faint stars)
   if (starControl > 0.001) {
     float minLuma = getLuma(minNeighbor);
-    float haloZone = smoothstep(0.03, 0.18, localPeak) * (1.0 - smoothstep(0.25, 0.55, localPeak));
-    float targetStarLuma = mix(luma, min(luma, mix(scale1Luma, minLuma, 0.45)), starControl * haloZone * 0.65);
+    // Only engage on large bright star halos where scale1Luma is already elevated (> 0.18)
+    float outerHaloZone = smoothstep(0.18, 0.42, scale1Luma) * smoothstep(0.03, 0.15, localPeak) * (1.0 - smoothstep(0.22, 0.48, localPeak));
+    float targetStarLuma = mix(luma, min(luma, mix(scale1Luma, minLuma, 0.35)), starControl * outerHaloZone * 0.55);
     if (luma > 0.0001) {
       rgb *= (targetStarLuma / luma);
       luma = targetStarLuma;
     }
   }
 
-  // 5. Luminance Background Smoothing
+  // 5. Luminance Background Smoothing (Strictly masked off stars so faint stars are never blurred away)
   if (denoise > 0.001) {
     float edgeDiff = abs(luma - scale1Luma);
-    float flatMask = (1.0 - smoothstep(0.015, 0.14, edgeDiff)) * (1.0 - starMask);
-    float smoothLuma = mix(luma, scale1Luma, denoise * flatMask * 0.85);
+    float flatMask = (1.0 - smoothstep(0.01, 0.08, edgeDiff)) * (1.0 - starMask);
+    float smoothLuma = mix(luma, scale1Luma, denoise * flatMask * 0.8);
     if (luma > 0.0001) {
       rgb *= (smoothLuma / luma);
       luma = smoothLuma;
     }
   }
 
-  // 6. Multi-Scale Wavelet Sharpening (Layer 1: Fine 1px + Layer 2: Medium 2.5px)
+  // 6. Multi-Scale Wavelet Sharpening
   if (waveletFine > 0.001 || waveletMed > 0.001) {
     float wLayer1 = luma - scale1Luma;
     float wLayer2 = scale1Luma - scale2Luma;
-    // Protect stars and high-contrast planetary limbs from ringing
     float limbGuard = 1.0 - smoothstep(0.22, 0.55, abs(wLayer2));
     float detailMask = (1.0 - starMask) * smoothstep(0.03, 0.15, luma) * limbGuard;
     float sharpLuma = max(0.0, luma + (wLayer1 * waveletFine * 1.45 + wLayer2 * waveletMed * 1.25) * detailMask);
@@ -297,13 +300,13 @@ half4 main(float2 xy) {
     }
   }
 
-  // 7. Black Point Floor
+  // 7. Black Point Floor (Gentle toe curve so faint stars near sky floor are preserved)
   if (blackPoint > 0.001) {
-    float neutralFloor = blackPoint * 0.85;
+    float neutralFloor = blackPoint * 0.75;
     rgb = max(rgb - float3(neutralFloor), float3(0.0)) / max(1.0 - neutralFloor, 0.05);
   }
 
-  // 8. Pure Luminance-Preserving Asinh Stretch
+  // 8. Pure Luminance-Preserving Asinh Stretch (Boosts faint stars and nebulosity equally)
   if (stretch > 0.001) {
     float curLuma = getLuma(rgb);
     if (curLuma > 0.0001) {
@@ -330,8 +333,8 @@ half4 main(float2 xy) {
 
   // 11. Shadow Chroma Neutralization + Midtone-Only Vibrance
   float postLuma = getLuma(rgb);
-  float shadowNeutralize = 1.0 - smoothstep(0.03, 0.14, postLuma);
-  rgb = mix(rgb, float3(postLuma), shadowNeutralize * 0.92);
+  float shadowNeutralize = (1.0 - smoothstep(0.025, 0.12, postLuma)) * (1.0 - starMask);
+  rgb = mix(rgb, float3(postLuma), shadowNeutralize * 0.9);
 
   if (vibrance > 0.001) {
     float maxC = max(rgb.r, max(rgb.g, rgb.b));
@@ -344,19 +347,18 @@ half4 main(float2 xy) {
 
   // 12. Natural White Star Core Recovery
   float finalLuma = getLuma(rgb);
-  float coreWhiteMask = smoothstep(0.58, 0.88, finalLuma) * mix(0.5, 1.0, starControl);
-  float starColorTame = starMask * starControl * 0.68;
-  rgb = mix(rgb, float3(finalLuma), clamp(coreWhiteMask + starColorTame, 0.0, 0.97));
+  float coreWhiteMask = smoothstep(0.62, 0.90, finalLuma) * mix(0.45, 1.0, starControl);
+  rgb = mix(rgb, float3(finalLuma), clamp(coreWhiteMask, 0.0, 0.95));
 
   rgb = clamp(rgb, 0.0, 1.0);
 
   // 13. Optional Highlight/Shadow Clipping Indicator Overlay
   if (showClipping > 0.5) {
     if (rgb.r >= 0.992 || rgb.g >= 0.992 || rgb.b >= 0.992) {
-      return half4(1.0, 0.15, 0.15, center.a); // Red = clipped highlights
+      return half4(1.0, 0.15, 0.15, center.a);
     }
     if (rgb.r <= 0.003 && rgb.g <= 0.003 && rgb.b <= 0.003) {
-      return half4(0.15, 0.45, 1.0, center.a); // Blue = crushed blacks
+      return half4(0.15, 0.45, 1.0, center.a);
     }
   }
 
