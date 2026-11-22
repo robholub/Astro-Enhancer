@@ -1,4 +1,4 @@
-name: Build Android App
+name: Build Android APK (Native GitHub Runner)
 
 on:
   push:
@@ -19,11 +19,11 @@ jobs:
         with:
           node-version: 22
 
-      - name: Setup Expo & EAS CLI
-        uses: expo/expo-github-action@v8
+      - name: Setup Java JDK 17
+        uses: actions/setup-java@v4
         with:
-          eas-version: latest
-          token: ${{ secrets.EXPO_TOKEN }}
+          distribution: temurin
+          java-version: 17
 
       - name: Generate App Icon
         run: |
@@ -99,5 +99,55 @@ jobs:
       - name: Install dependencies
         run: npm install --legacy-peer-deps && npx expo install --fix
 
-      - name: Trigger EAS Android Build
-        run: eas build --platform android --profile preview --no-wait
+      - name: Generate Native Android Project
+        run: npx expo prebuild --platform android --non-interactive
+
+      - name: Configure Release Keystore Signing
+        run: |
+          keytool -genkeypair -v -storetype PKCS12 \
+            -keystore android/app/release.keystore \
+            -alias astrokey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass astro1234 -keypass astro1234 \
+            -dname "CN=AstroEnhancer, OU=Astro, O=AstroEnhancer, L=Earth, S=Space, C=US"
+
+          cat << 'EOF' >> android/gradle.properties
+          MYAPP_UPLOAD_STORE_FILE=release.keystore
+          MYAPP_UPLOAD_KEY_ALIAS=astrokey
+          MYAPP_UPLOAD_STORE_PASSWORD=astro1234
+          MYAPP_UPLOAD_KEY_PASSWORD=astro1234
+          EOF
+
+          node -e '
+          const fs = require("fs");
+          const gradlePath = "android/app/build.gradle";
+          let content = fs.readFileSync(gradlePath, "utf8");
+          const releaseSigning = `
+                  release {
+                      if (project.hasProperty("MYAPP_UPLOAD_STORE_FILE")) {
+                          storeFile file(MYAPP_UPLOAD_STORE_FILE)
+                          storePassword MYAPP_UPLOAD_STORE_PASSWORD
+                          keyAlias MYAPP_UPLOAD_KEY_ALIAS
+                          keyPassword MYAPP_UPLOAD_KEY_PASSWORD
+                      }
+                  }`;
+          content = content.replace("signingConfigs {", "signingConfigs {" + releaseSigning);
+          content = content.replace(
+            /buildTypes\s*\{[\s\S]*?release\s*\{[\s\S]*?signingConfig\s+signingConfigs\.debug/,
+            (match) => match.replace("signingConfigs.debug", "signingConfigs.release")
+          );
+          fs.writeFileSync(gradlePath, content);
+          '
+
+      - name: Build Release APK with Gradle
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AstroEnhancer-Android-APK
+          path: android/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
