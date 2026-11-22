@@ -1,9 +1,11 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  GestureResponderEvent,
+  LayoutChangeEvent,
+  PanResponder,
   Pressable,
-  SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
@@ -11,6 +13,7 @@ import {
   useWindowDimensions,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
+import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as ImagePicker from 'expo-image-picker';
 import * as MediaLibrary from 'expo-media-library';
 import { File, Paths } from 'expo-file-system';
@@ -57,35 +60,32 @@ function computeAutoParams(img: SkImage): AstroParams {
     }
 
     lumas.sort((a, b) => a - b);
-    const p10 = lumas[Math.floor(lumas.length * 0.1)] ?? 0.05;   // Background sky level
-    const p50 = lumas[Math.floor(lumas.length * 0.5)] ?? 0.15;   // Median subject brightness
-    const p95 = lumas[Math.floor(lumas.length * 0.95)] ?? 0.75;  // Highlights
+    const p10 = lumas[Math.floor(lumas.length * 0.1)] ?? 0.05;
+    const p50 = lumas[Math.floor(lumas.length * 0.5)] ?? 0.15;
+    const p95 = lumas[Math.floor(lumas.length * 0.95)] ?? 0.75;
 
-    // Bright planetary/lunar/solar frames have high p95 and low background or high median
     const isBrightTarget = p50 > 0.32 || (p10 < 0.04 && p95 > 0.78);
 
     if (isBrightTarget) {
-      // Moon, Sun, or bright planet: gentle stretch, strong crisp detail, protect highlights
       return {
         stretch: 0.18,
         blackPoint: Math.min(0.08, Math.max(0.01, Number((p10 * 0.7).toFixed(2)))),
-        sharpen: 0.95,
-        denoise: 0.3,
+        sharpen: 1.05,
+        denoise: 0.4,
         vibrance: 0.3,
-        starControl: 0.35,
+        starControl: 0.2,
       };
     }
 
-    // Deep sky (nebula, galaxy, star cluster): adapt stretch to how dark the midtones are
-    const autoStretch = Math.min(0.75, Math.max(0.28, Number((0.72 - p50 * 1.4).toFixed(2))));
+    const autoStretch = Math.min(0.72, Math.max(0.28, Number((0.7 - p50 * 1.4).toFixed(2))));
     const autoBlack = Math.min(0.22, Math.max(0.02, Number((p10 * 0.85).toFixed(2))));
 
     return {
       stretch: autoStretch,
       blackPoint: autoBlack,
       sharpen: 0.45,
-      denoise: 0.5,
-      vibrance: 0.5,
+      denoise: 0.65,
+      vibrance: 0.48,
       starControl: 0.75,
     };
   } catch {
@@ -94,7 +94,17 @@ function computeAutoParams(img: SkImage): AstroParams {
 }
 
 export default function App() {
+  return (
+    <SafeAreaProvider>
+      <AstroEditorScreen />
+    </SafeAreaProvider>
+  );
+}
+
+function AstroEditorScreen() {
+  const insets = useSafeAreaInsets();
   const { width: screenWidth } = useWindowDimensions();
+
   const [imageUri, setImageUri] = useState<string | null>(null);
   const [activePresetId, setActivePresetId] = useState<string>('auto_pro');
   const [params, setParams] = useState<AstroParams>(ASTRO_PRESETS[0].params);
@@ -102,14 +112,29 @@ export default function App() {
   const [isSaving, setIsSaving] = useState<boolean>(false);
   const [renderTick, setRenderTick] = useState<number>(0);
 
+  // Pinch-to-zoom & pan state
+  const [zoom, setZoom] = useState<number>(1);
+  const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const zoomRef = useRef(1);
+  const panRef = useRef({ x: 0, y: 0 });
+  const gestureStartRef = useRef({
+    zoom: 1,
+    panX: 0,
+    panY: 0,
+    pinchDist: 0,
+    touchX: 0,
+    touchY: 0,
+    isPinching: false,
+  });
+
   const skImage = useImage(imageUri);
 
-  // Run automatic histogram analysis whenever a new photo finishes loading
   useEffect(() => {
     if (skImage) {
       const auto = computeAutoParams(skImage);
       setActivePresetId('auto_pro');
       setParams(auto);
+      resetZoom();
       setRenderTick((t) => t + 1);
     }
   }, [skImage]);
@@ -124,18 +149,113 @@ export default function App() {
 
   const canvasDimensions = useMemo(() => {
     const maxWidth = screenWidth - 32;
-    const maxHeight = 420;
+    const maxHeight = 380;
     if (!skImage) {
-      return { width: maxWidth, height: 320 };
+      return { width: maxWidth, height: 300, nativeScaleRatio: 1 };
     }
     const imgW = skImage.width();
     const imgH = skImage.height();
-    const scale = Math.min(maxWidth / imgW, maxHeight / imgH);
+    const fitScale = Math.min(maxWidth / imgW, maxHeight / imgH);
     return {
-      width: Math.round(imgW * scale),
-      height: Math.round(imgH * scale),
+      width: Math.round(imgW * fitScale),
+      height: Math.round(imgH * fitScale),
+      nativeScaleRatio: Math.max(1, 1 / fitScale),
     };
   }, [skImage, screenWidth]);
+
+  // Allow zooming from 1x fit-to-screen up to at least 1.5x beyond full native pixel resolution
+  const maxZoom = useMemo(() => {
+    return Math.max(4, Number((canvasDimensions.nativeScaleRatio * 1.5).toFixed(2)));
+  }, [canvasDimensions.nativeScaleRatio]);
+
+  const clampPan = useCallback(
+    (x: number, y: number, z: number) => {
+      const maxOffsetX = ((z - 1) * canvasDimensions.width) / 2;
+      const maxOffsetY = ((z - 1) * canvasDimensions.height) / 2;
+      return {
+        x: Math.min(maxOffsetX, Math.max(-maxOffsetX, x)),
+        y: Math.min(maxOffsetY, Math.max(-maxOffsetY, y)),
+      };
+    },
+    [canvasDimensions.width, canvasDimensions.height]
+  );
+
+  const resetZoom = useCallback(() => {
+    zoomRef.current = 1;
+    panRef.current = { x: 0, y: 0 };
+    setZoom(1);
+    setPan({ x: 0, y: 0 });
+  }, []);
+
+  const zoomToNative100 = useCallback(() => {
+    const target = Math.min(maxZoom, Math.max(1, canvasDimensions.nativeScaleRatio));
+    zoomRef.current = target;
+    panRef.current = { x: 0, y: 0 };
+    setZoom(target);
+    setPan({ x: 0, y: 0 });
+  }, [canvasDimensions.nativeScaleRatio, maxZoom]);
+
+  const getTouchDistance = (touches: readonly { pageX: number; pageY: number }[]) => {
+    if (touches.length < 2) return 0;
+    const dx = touches[0].pageX - touches[1].pageX;
+    const dy = touches[0].pageY - touches[1].pageY;
+    return Math.hypot(dx, dy);
+  };
+
+  const viewportPanResponder = useMemo(
+    () =>
+      PanResponder.create({
+        onStartShouldSetPanResponder: () => true,
+        onMoveShouldSetPanResponder: (_, gs) =>
+          Math.abs(gs.dx) > 2 || Math.abs(gs.dy) > 2 || gs.numberActiveTouches >= 2,
+        onPanResponderGrant: (evt: GestureResponderEvent) => {
+          const touches = evt.nativeEvent.touches;
+          gestureStartRef.current = {
+            zoom: zoomRef.current,
+            panX: panRef.current.x,
+            panY: panRef.current.y,
+            pinchDist: touches.length >= 2 ? getTouchDistance(touches) : 0,
+            touchX: touches[0]?.pageX ?? 0,
+            touchY: touches[0]?.pageY ?? 0,
+            isPinching: touches.length >= 2,
+          };
+        },
+        onPanResponderMove: (evt: GestureResponderEvent) => {
+          const touches = evt.nativeEvent.touches;
+          if (touches.length >= 2) {
+            const dist = getTouchDistance(touches);
+            if (!gestureStartRef.current.isPinching || gestureStartRef.current.pinchDist === 0) {
+              gestureStartRef.current.isPinching = true;
+              gestureStartRef.current.pinchDist = dist;
+              gestureStartRef.current.zoom = zoomRef.current;
+              return;
+            }
+            const ratio = dist / gestureStartRef.current.pinchDist;
+            const nextZoom = Math.min(maxZoom, Math.max(1, gestureStartRef.current.zoom * ratio));
+            const nextPan = clampPan(panRef.current.x, panRef.current.y, nextZoom);
+            zoomRef.current = nextZoom;
+            panRef.current = nextPan;
+            setZoom(nextZoom);
+            setPan(nextPan);
+          } else if (touches.length === 1 && !gestureStartRef.current.isPinching) {
+            if (zoomRef.current <= 1.01) return;
+            const dx = touches[0].pageX - gestureStartRef.current.touchX;
+            const dy = touches[0].pageY - gestureStartRef.current.touchY;
+            const nextPan = clampPan(
+              gestureStartRef.current.panX + dx,
+              gestureStartRef.current.panY + dy,
+              zoomRef.current
+            );
+            panRef.current = nextPan;
+            setPan(nextPan);
+          }
+        },
+        onPanResponderRelease: () => {
+          gestureStartRef.current.isPinching = false;
+        },
+      }),
+    [clampPan, maxZoom]
+  );
 
   const pickImage = async () => {
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
@@ -160,6 +280,7 @@ export default function App() {
       if (presetId === 'auto_pro' && skImage) {
         setActivePresetId('auto_pro');
         setParams(computeAutoParams(skImage));
+        setShowOriginal(false);
         setRenderTick((t) => t + 1);
         return;
       }
@@ -167,20 +288,22 @@ export default function App() {
       if (found) {
         setActivePresetId(found.id);
         setParams({ ...found.params });
+        setShowOriginal(false);
         setRenderTick((t) => t + 1);
       }
     },
     [skImage]
   );
 
-  const adjustParam = (key: keyof AstroParams, delta: number, min: number, max: number) => {
+  const updateParamValue = useCallback((key: keyof AstroParams, newVal: number) => {
     setActivePresetId('custom');
+    setShowOriginal(false);
     setParams((prev) => ({
       ...prev,
-      [key]: Math.min(max, Math.max(min, Number((prev[key] + delta).toFixed(2)))),
+      [key]: Number(newVal.toFixed(2)),
     }));
     setRenderTick((t) => t + 1);
-  };
+  }, []);
 
   const exportFullResolution = async () => {
     if (!skImage || !runtimeEffect) return;
@@ -257,7 +380,8 @@ export default function App() {
     }
   };
 
-  const activeParams = showOriginal ? ASTRO_PRESETS[4].params : params;
+  const originalPreset = ASTRO_PRESETS[ASTRO_PRESETS.length - 1];
+  const activeParams = showOriginal ? originalPreset.params : params;
 
   const uniforms = {
     resolution: [canvasDimensions.width, canvasDimensions.height],
@@ -269,59 +393,103 @@ export default function App() {
     starControl: activeParams.starControl,
   };
 
+  const zoomPercent = skImage
+    ? Math.round((zoom / canvasDimensions.nativeScaleRatio) * 100)
+    : 100;
+
   return (
-    <SafeAreaView style={styles.container}>
-      <StatusBar style="light" />
-      <ScrollView contentContainerStyle={styles.scrollContent}>
+    <View style={[styles.container, { paddingTop: insets.top, paddingBottom: insets.bottom }]}>
+      <StatusBar style="light" backgroundColor="#070A12" />
+      <ScrollView
+        contentContainerStyle={styles.scrollContent}
+        scrollEnabled={zoom <= 1.02}
+      >
         {/* Header */}
         <View style={styles.header}>
-          <View>
+          <View style={{ flex: 1, paddingRight: 8 }}>
             <Text style={styles.title}>AstroEnhancer</Text>
-            <Text style={styles.subtitle}>Natural Deep-Sky, Lunar & Planetary Processor</Text>
+            <Text style={styles.subtitle}>Natural Deep-Sky, Solar, Lunar & Planetary Processor</Text>
           </View>
           <Pressable style={styles.primaryBtn} onPress={pickImage}>
             <Text style={styles.primaryBtnText}>{imageUri ? 'Change Photo' : 'Open Photo'}</Text>
           </Pressable>
         </View>
 
-        {/* Preview Viewport */}
-        <View style={[styles.canvasContainer, { height: canvasDimensions.height + 16 }]}>
+        {/* Pinch-to-Zoom & Pan Preview Viewport */}
+        <View style={[styles.canvasContainer, { height: canvasDimensions.height + 44 }]}>
           {skImage && runtimeEffect ? (
-            <Pressable
-              onPressIn={() => setShowOriginal(true)}
-              onPressOut={() => setShowOriginal(false)}
-              style={{ width: canvasDimensions.width, height: canvasDimensions.height }}
-            >
-              <Canvas
-                key={`canvas-${renderTick}-${showOriginal ? 'orig' : 'edit'}`}
-                style={{ width: canvasDimensions.width, height: canvasDimensions.height }}
+            <>
+              <View
+                {...viewportPanResponder.panHandlers}
+                style={[
+                  styles.viewportClip,
+                  { width: canvasDimensions.width, height: canvasDimensions.height },
+                ]}
               >
-                <Fill>
-                  <Shader source={runtimeEffect} uniforms={uniforms}>
-                    <ImageShader
-                      image={skImage}
-                      fit="contain"
-                      rect={{
-                        x: 0,
-                        y: 0,
-                        width: canvasDimensions.width,
-                        height: canvasDimensions.height,
-                      }}
-                    />
-                  </Shader>
-                </Fill>
-              </Canvas>
-              <View style={styles.badge}>
-                <Text style={styles.badgeText}>
-                  {showOriginal ? 'RAW ORIGINAL' : 'ENHANCED (HOLD TO COMPARE)'}
-                </Text>
+                <View
+                  style={{
+                    width: canvasDimensions.width,
+                    height: canvasDimensions.height,
+                    transform: [
+                      { translateX: pan.x },
+                      { translateY: pan.y },
+                      { scale: zoom },
+                    ],
+                  }}
+                >
+                  <Canvas
+                    key={`canvas-${renderTick}-${showOriginal ? 'orig' : 'edit'}`}
+                    style={{ width: canvasDimensions.width, height: canvasDimensions.height }}
+                  >
+                    <Fill>
+                      <Shader source={runtimeEffect} uniforms={uniforms}>
+                        <ImageShader
+                          image={skImage}
+                          fit="contain"
+                          rect={{
+                            x: 0,
+                            y: 0,
+                            width: canvasDimensions.width,
+                            height: canvasDimensions.height,
+                          }}
+                        />
+                      </Shader>
+                    </Fill>
+                  </Canvas>
+                </View>
               </View>
-            </Pressable>
+
+              {/* Viewport Toolbar: Compare Toggle + Zoom Controls */}
+              <View style={styles.viewportBar}>
+                <Pressable
+                  style={[styles.barChip, showOriginal && styles.barChipWarn]}
+                  onPress={() => {
+                    setShowOriginal((v) => !v);
+                    setRenderTick((t) => t + 1);
+                  }}
+                >
+                  <Text style={styles.barChipText}>
+                    {showOriginal ? 'Showing: Raw' : 'Compare Raw'}
+                  </Text>
+                </Pressable>
+
+                <View style={styles.zoomGroup}>
+                  <Pressable style={styles.barChip} onPress={zoomToNative100}>
+                    <Text style={styles.barChipText}>100% Native ({zoomPercent}%)</Text>
+                  </Pressable>
+                  {zoom > 1.02 && (
+                    <Pressable style={[styles.barChip, { marginLeft: 6 }]} onPress={resetZoom}>
+                      <Text style={styles.barChipText}>Fit</Text>
+                    </Pressable>
+                  )}
+                </View>
+              </View>
+            </>
           ) : (
             <Pressable style={styles.emptyState} onPress={pickImage}>
               <Text style={styles.emptyTitle}>Tap to Load Astrophoto</Text>
               <Text style={styles.emptyDesc}>
-                Automatically balances Nebulas, Galaxies, Moon, Sun & Planets
+                Pinch to zoom up to full native resolution • Dedicated profiles for Nebula, Galaxies, Moon, Sun & Planets
               </Text>
             </Pressable>
           )}
@@ -333,7 +501,7 @@ export default function App() {
             <Text style={styles.sectionTitle}>Enhancement Profiles</Text>
             <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.presetRow}>
               {ASTRO_PRESETS.map((preset) => {
-                const isSelected = activePresetId === preset.id;
+                const isSelected = activePresetId === preset.id && !showOriginal;
                 return (
                   <Pressable
                     key={preset.id}
@@ -349,44 +517,51 @@ export default function App() {
               })}
             </ScrollView>
 
-            {/* Manual Fine-Tuning */}
+            {/* Manual Fine-Tuning Sliders */}
             <Text style={styles.sectionTitle}>Fine-Tune Pipeline</Text>
             <View style={styles.controlsCard}>
-              <ControlRow
+              <SliderRow
                 label="Detail Stretch (Faint Gas & Dust)"
                 value={params.stretch}
-                onDec={() => adjustParam('stretch', -0.05, 0, 1)}
-                onInc={() => adjustParam('stretch', 0.05, 0, 1)}
+                min={0}
+                max={1}
+                onChange={(v) => updateParamValue('stretch', v)}
               />
-              <ControlRow
+              <SliderRow
                 label="Sky Background Floor"
                 value={params.blackPoint}
-                onDec={() => adjustParam('blackPoint', -0.02, 0, 0.4)}
-                onInc={() => adjustParam('blackPoint', 0.02, 0, 0.4)}
+                min={0}
+                max={0.35}
+                onChange={(v) => updateParamValue('blackPoint', v)}
               />
-              <ControlRow
+              <SliderRow
                 label="Star Control & White Cores"
                 value={params.starControl}
-                onDec={() => adjustParam('starControl', -0.1, 0, 1)}
-                onInc={() => adjustParam('starControl', 0.1, 0, 1)}
+                min={0}
+                max={1}
+                onChange={(v) => updateParamValue('starControl', v)}
               />
-              <ControlRow
-                label="Structure & Crater Sharpen"
+              <SliderRow
+                label="Structure & Surface Sharpen"
                 value={params.sharpen}
-                onDec={() => adjustParam('sharpen', -0.1, 0, 1.5)}
-                onInc={() => adjustParam('sharpen', 0.1, 0, 1.5)}
+                min={0}
+                max={1.5}
+                onChange={(v) => updateParamValue('sharpen', v)}
               />
-              <ControlRow
+              <SliderRow
                 label="Natural Midtone Color"
                 value={params.vibrance}
-                onDec={() => adjustParam('vibrance', -0.1, 0, 1.5)}
-                onInc={() => adjustParam('vibrance', 0.1, 0, 1.5)}
+                min={0}
+                max={1.5}
+                onChange={(v) => updateParamValue('vibrance', v)}
               />
-              <ControlRow
-                label="Background Denoise"
+              <SliderRow
+                label="Chroma & Background Denoise"
                 value={params.denoise}
-                onDec={() => adjustParam('denoise', -0.1, 0, 1)}
-                onInc={() => adjustParam('denoise', 0.1, 0, 1)}
+                min={0}
+                max={1}
+                isLast
+                onChange={(v) => updateParamValue('denoise', v)}
               />
             </View>
 
@@ -407,32 +582,79 @@ export default function App() {
           </>
         )}
       </ScrollView>
-    </SafeAreaView>
+    </View>
   );
 }
 
-function ControlRow({
+function SliderRow({
   label,
   value,
-  onDec,
-  onInc,
+  min,
+  max,
+  isLast = false,
+  onChange,
 }: {
   label: string;
   value: number;
-  onDec: () => void;
-  onInc: () => void;
+  min: number;
+  max: number;
+  isLast?: boolean;
+  onChange: (val: number) => void;
 }) {
+  const trackWidthRef = useRef(1);
+  const startRatioRef = useRef(0);
+
+  const ratio = Math.min(1, Math.max(0, (value - min) / (max - min)));
+  const ratioRef = useRef(ratio);
+  ratioRef.current = ratio;
+
+  const updateFromRatio = useCallback(
+    (r: number) => {
+      const clamped = Math.min(1, Math.max(0, r));
+      const mapped = min + clamped * (max - min);
+      onChange(mapped);
+    },
+    [min, max, onChange]
+  );
+
+  const panResponder = useMemo(
+    () =>
+      PanResponder.create({
+        onStartShouldSetPanResponder: () => true,
+        onMoveShouldSetPanResponder: () => true,
+        onPanResponderGrant: (evt) => {
+          const touchX = evt.nativeEvent.locationX;
+          const clickedRatio = touchX / Math.max(1, trackWidthRef.current);
+          startRatioRef.current = clickedRatio;
+          updateFromRatio(clickedRatio);
+        },
+        onPanResponderMove: (_, gs) => {
+          const deltaRatio = gs.dx / Math.max(1, trackWidthRef.current);
+          updateFromRatio(startRatioRef.current + deltaRatio);
+        },
+      }),
+    [updateFromRatio]
+  );
+
+  const onTrackLayout = (e: LayoutChangeEvent) => {
+    trackWidthRef.current = e.nativeEvent.layout.width;
+  };
+
   return (
-    <View style={styles.controlRow}>
-      <Text style={styles.controlLabel}>{label}</Text>
-      <View style={styles.stepper}>
-        <Pressable style={styles.stepBtn} onPress={onDec}>
-          <Text style={styles.stepBtnText}>-</Text>
-        </Pressable>
-        <Text style={styles.stepVal}>{Math.round(value * 100)}%</Text>
-        <Pressable style={styles.stepBtn} onPress={onInc}>
-          <Text style={styles.stepBtnText}>+</Text>
-        </Pressable>
+    <View style={[styles.sliderRow, isLast && { borderBottomWidth: 0 }]}>
+      <View style={styles.sliderHeader}>
+        <Text style={styles.controlLabel}>{label}</Text>
+        <Text style={styles.stepVal}>{Math.round(ratio * 100)}%</Text>
+      </View>
+      <View
+        style={styles.sliderTouchArea}
+        onLayout={onTrackLayout}
+        {...panResponder.panHandlers}
+      >
+        <View style={styles.sliderTrack}>
+          <View style={[styles.sliderFill, { width: `${ratio * 100}%` }]} />
+        </View>
+        <View style={[styles.sliderThumb, { left: `${ratio * 100}%` }]} />
       </View>
     </View>
   );
@@ -451,7 +673,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 16,
+    marginBottom: 14,
   },
   title: {
     fontSize: 22,
@@ -484,7 +706,40 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
     overflow: 'hidden',
-    marginBottom: 20,
+    marginBottom: 18,
+  },
+  viewportClip: {
+    overflow: 'hidden',
+    backgroundColor: '#05070D',
+  },
+  viewportBar: {
+    width: '100%',
+    height: 38,
+    paddingHorizontal: 10,
+    backgroundColor: '#0B111E',
+    borderTopWidth: 1,
+    borderTopColor: '#1E293B',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  zoomGroup: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  barChip: {
+    backgroundColor: '#1E293B',
+    paddingHorizontal: 9,
+    paddingVertical: 4,
+    borderRadius: 6,
+  },
+  barChipWarn: {
+    backgroundColor: '#7C2D12',
+  },
+  barChipText: {
+    color: '#E2E8F0',
+    fontSize: 11,
+    fontWeight: '600',
   },
   emptyState: {
     padding: 32,
@@ -500,21 +755,7 @@ const styles = StyleSheet.create({
     color: '#64748B',
     fontSize: 13,
     textAlign: 'center',
-  },
-  badge: {
-    position: 'absolute',
-    bottom: 8,
-    alignSelf: 'center',
-    backgroundColor: 'rgba(7, 10, 18, 0.78)',
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 6,
-  },
-  badgeText: {
-    color: '#CBD5E1',
-    fontSize: 10,
-    fontWeight: '700',
-    letterSpacing: 0.6,
+    lineHeight: 18,
   },
   sectionTitle: {
     color: '#E2E8F0',
@@ -523,10 +764,10 @@ const styles = StyleSheet.create({
     marginBottom: 10,
   },
   presetRow: {
-    marginBottom: 20,
+    marginBottom: 18,
   },
   presetCard: {
-    width: 165,
+    width: 155,
     backgroundColor: '#0F172A',
     borderWidth: 1,
     borderColor: '#1E293B',
@@ -557,45 +798,54 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     borderWidth: 1,
     borderColor: '#1E293B',
-    padding: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 6,
     marginBottom: 20,
   },
-  controlRow: {
+  sliderRow: {
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: '#1E293B',
+  },
+  sliderHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    paddingVertical: 8,
-    borderBottomWidth: 1,
-    borderBottomColor: '#1E293B',
+    marginBottom: 6,
   },
   controlLabel: {
     color: '#CBD5E1',
     fontSize: 13,
-    flex: 1,
-  },
-  stepper: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  stepBtn: {
-    backgroundColor: '#1E293B',
-    width: 30,
-    height: 30,
-    borderRadius: 6,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  stepBtnText: {
-    color: '#F8FAFC',
-    fontSize: 16,
-    fontWeight: '700',
   },
   stepVal: {
     color: '#38BDF8',
-    width: 48,
-    textAlign: 'center',
-    fontWeight: '600',
-    fontSize: 13,
+    fontWeight: '700',
+    fontSize: 12,
+  },
+  sliderTouchArea: {
+    height: 26,
+    justifyContent: 'center',
+    position: 'relative',
+  },
+  sliderTrack: {
+    height: 5,
+    borderRadius: 3,
+    backgroundColor: '#1E293B',
+    overflow: 'hidden',
+  },
+  sliderFill: {
+    height: '100%',
+    backgroundColor: '#38BDF8',
+  },
+  sliderThumb: {
+    position: 'absolute',
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    backgroundColor: '#F8FAFC',
+    borderWidth: 2.5,
+    borderColor: '#38BDF8',
+    marginLeft: -9,
   },
   exportBtn: {
     backgroundColor: '#38BDF8',
