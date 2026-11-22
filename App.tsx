@@ -71,22 +71,22 @@ function computeAutoParams(img: SkImage): AstroParams {
         stretch: 0.18,
         blackPoint: Math.min(0.08, Math.max(0.01, Number((p10 * 0.7).toFixed(2)))),
         sharpen: 1.05,
-        denoise: 0.4,
+        denoise: 0.45,
         vibrance: 0.3,
         starControl: 0.2,
       };
     }
 
-    const autoStretch = Math.min(0.72, Math.max(0.28, Number((0.7 - p50 * 1.4).toFixed(2))));
+    const autoStretch = Math.min(0.7, Math.max(0.28, Number((0.68 - p50 * 1.4).toFixed(2))));
     const autoBlack = Math.min(0.22, Math.max(0.02, Number((p10 * 0.85).toFixed(2))));
 
     return {
       stretch: autoStretch,
       blackPoint: autoBlack,
       sharpen: 0.45,
-      denoise: 0.65,
-      vibrance: 0.48,
-      starControl: 0.75,
+      denoise: 0.75,
+      vibrance: 0.42,
+      starControl: 0.78,
     };
   } catch {
     return ASTRO_PRESETS[0].params;
@@ -103,7 +103,7 @@ export default function App() {
 
 function AstroEditorScreen() {
   const insets = useSafeAreaInsets();
-  const { width: screenWidth } = useWindowDimensions();
+  const { width: screenWidth, height: screenHeight } = useWindowDimensions();
 
   const [imageUri, setImageUri] = useState<string | null>(null);
   const [activePresetId, setActivePresetId] = useState<string>('auto_pro');
@@ -147,11 +147,12 @@ function AstroEditorScreen() {
     return effect;
   }, []);
 
+  // Size preview proportionally so top preview + scrollable controls + bottom save bar all fit comfortably
   const canvasDimensions = useMemo(() => {
-    const maxWidth = screenWidth - 32;
-    const maxHeight = 380;
+    const maxWidth = screenWidth - 24;
+    const maxHeight = Math.min(310, Math.round(screenHeight * 0.36));
     if (!skImage) {
-      return { width: maxWidth, height: 300, nativeScaleRatio: 1 };
+      return { width: maxWidth, height: Math.min(260, maxHeight), nativeScaleRatio: 1 };
     }
     const imgW = skImage.width();
     const imgH = skImage.height();
@@ -161,9 +162,8 @@ function AstroEditorScreen() {
       height: Math.round(imgH * fitScale),
       nativeScaleRatio: Math.max(1, 1 / fitScale),
     };
-  }, [skImage, screenWidth]);
+  }, [skImage, screenWidth, screenHeight]);
 
-  // Allow zooming from 1x fit-to-screen up to at least 1.5x beyond full native pixel resolution
   const maxZoom = useMemo(() => {
     return Math.max(4, Number((canvasDimensions.nativeScaleRatio * 1.5).toFixed(2)));
   }, [canvasDimensions.nativeScaleRatio]);
@@ -398,13 +398,11 @@ function AstroEditorScreen() {
     : 100;
 
   return (
-    <View style={[styles.container, { paddingTop: insets.top, paddingBottom: insets.bottom }]}>
+    <View style={[styles.container, { paddingTop: insets.top }]}>
       <StatusBar style="light" backgroundColor="#070A12" />
-      <ScrollView
-        contentContainerStyle={styles.scrollContent}
-        scrollEnabled={zoom <= 1.02}
-      >
-        {/* Header */}
+
+      {/* PINNED TOP: Header + Live Preview Viewport */}
+      <View style={styles.pinnedTop}>
         <View style={styles.header}>
           <View style={{ flex: 1, paddingRight: 8 }}>
             <Text style={styles.title}>AstroEnhancer</Text>
@@ -415,8 +413,7 @@ function AstroEditorScreen() {
           </Pressable>
         </View>
 
-        {/* Pinch-to-Zoom & Pan Preview Viewport */}
-        <View style={[styles.canvasContainer, { height: canvasDimensions.height + 44 }]}>
+        <View style={[styles.canvasContainer, { height: canvasDimensions.height + (skImage ? 38 : 0) }]}>
           {skImage && runtimeEffect ? (
             <>
               <View
@@ -459,7 +456,6 @@ function AstroEditorScreen() {
                 </View>
               </View>
 
-              {/* Viewport Toolbar: Compare Toggle + Zoom Controls */}
               <View style={styles.viewportBar}>
                 <Pressable
                   style={[styles.barChip, showOriginal && styles.barChipWarn]}
@@ -494,10 +490,15 @@ function AstroEditorScreen() {
             </Pressable>
           )}
         </View>
+      </View>
 
-        {/* Target Presets */}
-        {skImage && (
-          <>
+      {/* MIDDLE SCROLLABLE AREA: Presets & Fine-Tune Sliders */}
+      {skImage ? (
+        <>
+          <ScrollView
+            style={styles.middleScroll}
+            contentContainerStyle={styles.middleScrollContent}
+          >
             <Text style={styles.sectionTitle}>Enhancement Profiles</Text>
             <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.presetRow}>
               {ASTRO_PRESETS.map((preset) => {
@@ -517,7 +518,6 @@ function AstroEditorScreen() {
               })}
             </ScrollView>
 
-            {/* Manual Fine-Tuning Sliders */}
             <Text style={styles.sectionTitle}>Fine-Tune Pipeline</Text>
             <View style={styles.controlsCard}>
               <SliderRow
@@ -556,7 +556,7 @@ function AstroEditorScreen() {
                 onChange={(v) => updateParamValue('vibrance', v)}
               />
               <SliderRow
-                label="Chroma & Background Denoise"
+                label="Hot-Pixel & Chroma Denoise"
                 value={params.denoise}
                 min={0}
                 max={1}
@@ -564,8 +564,10 @@ function AstroEditorScreen() {
                 onChange={(v) => updateParamValue('denoise', v)}
               />
             </View>
+          </ScrollView>
 
-            {/* Export Button */}
+          {/* PINNED BOTTOM: Save Full-Resolution Button */}
+          <View style={[styles.pinnedBottom, { paddingBottom: Math.max(12, insets.bottom + 8) }]}>
             <Pressable
               style={[styles.exportBtn, isSaving && styles.exportBtnDisabled]}
               onPress={exportFullResolution}
@@ -579,9 +581,11 @@ function AstroEditorScreen() {
                 </Text>
               )}
             </Pressable>
-          </>
-        )}
-      </ScrollView>
+          </View>
+        </>
+      ) : (
+        <View style={{ flex: 1 }} />
+      )}
     </View>
   );
 }
@@ -605,8 +609,6 @@ function SliderRow({
   const startRatioRef = useRef(0);
 
   const ratio = Math.min(1, Math.max(0, (value - min) / (max - min)));
-  const ratioRef = useRef(ratio);
-  ratioRef.current = ratio;
 
   const updateFromRatio = useCallback(
     (r: number) => {
@@ -665,38 +667,42 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#070A12',
   },
-  scrollContent: {
-    padding: 16,
-    paddingBottom: 40,
+  pinnedTop: {
+    paddingHorizontal: 12,
+    paddingTop: 8,
+    paddingBottom: 10,
+    backgroundColor: '#070A12',
+    borderBottomWidth: 1,
+    borderBottomColor: '#1E293B',
   },
   header: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 14,
+    marginBottom: 10,
   },
   title: {
-    fontSize: 22,
+    fontSize: 20,
     fontWeight: '700',
     color: '#F8FAFC',
   },
   subtitle: {
-    fontSize: 12,
+    fontSize: 11,
     color: '#94A3B8',
-    marginTop: 2,
+    marginTop: 1,
   },
   primaryBtn: {
     backgroundColor: '#1E293B',
     borderColor: '#38BDF8',
     borderWidth: 1,
-    paddingHorizontal: 14,
-    paddingVertical: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
     borderRadius: 8,
   },
   primaryBtnText: {
     color: '#38BDF8',
     fontWeight: '600',
-    fontSize: 14,
+    fontSize: 13,
   },
   canvasContainer: {
     backgroundColor: '#0D1322',
@@ -706,7 +712,6 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
     overflow: 'hidden',
-    marginBottom: 18,
   },
   viewportClip: {
     overflow: 'hidden',
@@ -742,7 +747,7 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   emptyState: {
-    padding: 32,
+    padding: 28,
     alignItems: 'center',
   },
   emptyTitle: {
@@ -757,22 +762,30 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     lineHeight: 18,
   },
+  middleScroll: {
+    flex: 1,
+  },
+  middleScrollContent: {
+    paddingHorizontal: 14,
+    paddingTop: 12,
+    paddingBottom: 20,
+  },
   sectionTitle: {
     color: '#E2E8F0',
-    fontSize: 15,
+    fontSize: 14,
     fontWeight: '600',
-    marginBottom: 10,
+    marginBottom: 8,
   },
   presetRow: {
-    marginBottom: 18,
+    marginBottom: 16,
   },
   presetCard: {
-    width: 155,
+    width: 150,
     backgroundColor: '#0F172A',
     borderWidth: 1,
     borderColor: '#1E293B',
     borderRadius: 10,
-    padding: 12,
+    padding: 10,
     marginRight: 10,
   },
   presetCardActive: {
@@ -782,8 +795,8 @@ const styles = StyleSheet.create({
   presetName: {
     color: '#F1F5F9',
     fontWeight: '700',
-    fontSize: 14,
-    marginBottom: 4,
+    fontSize: 13,
+    marginBottom: 3,
   },
   presetNameActive: {
     color: '#38BDF8',
@@ -791,7 +804,7 @@ const styles = StyleSheet.create({
   presetDesc: {
     color: '#94A3B8',
     fontSize: 11,
-    lineHeight: 15,
+    lineHeight: 14,
   },
   controlsCard: {
     backgroundColor: '#0F172A',
@@ -799,11 +812,10 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#1E293B',
     paddingHorizontal: 14,
-    paddingVertical: 6,
-    marginBottom: 20,
+    paddingVertical: 4,
   },
   sliderRow: {
-    paddingVertical: 10,
+    paddingVertical: 9,
     borderBottomWidth: 1,
     borderBottomColor: '#1E293B',
   },
@@ -811,7 +823,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 6,
+    marginBottom: 5,
   },
   controlLabel: {
     color: '#CBD5E1',
@@ -847,9 +859,16 @@ const styles = StyleSheet.create({
     borderColor: '#38BDF8',
     marginLeft: -9,
   },
+  pinnedBottom: {
+    paddingHorizontal: 14,
+    paddingTop: 10,
+    backgroundColor: '#070A12',
+    borderTopWidth: 1,
+    borderTopColor: '#1E293B',
+  },
   exportBtn: {
     backgroundColor: '#38BDF8',
-    paddingVertical: 14,
+    paddingVertical: 13,
     borderRadius: 10,
     alignItems: 'center',
   },
