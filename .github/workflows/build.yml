@@ -1,14 +1,11 @@
-name: Build Android APK and AAB (Optimized)
+name: Build Android APK & Release AAB
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
 jobs:
   build_android:
-    name: Build Slim APK & Play Store AAB
+    name: Build Slim APK & Release-Signed AAB
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -69,7 +66,7 @@ jobs:
           const crcTable = new Uint32Array(256);
           for (let n = 0; n < 256; n++) {
             let c = n;
-            for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+            for (let k = 0 < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
             crcTable[n] = c;
           }
           function crc32(buf) {
@@ -102,7 +99,7 @@ jobs:
       - name: Generate Native Android Project
         run: npx expo prebuild --platform android --non-interactive
 
-      - name: Configure Signing, R8 Shrinking & Conditional ABI Splits
+      - name: Configure Release Signing, R8 Shrinking & Conditional ABI Splits
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
@@ -113,10 +110,34 @@ jobs:
 
           node -e '
           const fs = require("fs");
-          const gradlePath = "android/app/build.gradle";
-          let content = fs.readFileSync(gradlePath, "utf8");
 
-          const releaseSigning = `
+          if (fs.existsSync("android/app/build.gradle.kts")) {
+            let kts = fs.readFileSync("android/app/build.gradle.kts", "utf8");
+            const ktsSigning = `
+                  create("release") {
+                      storeFile = file(project.property("MYAPP_UPLOAD_STORE_FILE") as String)
+                      storePassword = project.property("MYAPP_UPLOAD_STORE_PASSWORD") as String
+                      keyAlias = project.property("MYAPP_UPLOAD_KEY_ALIAS") as String
+                      keyPassword = project.property("MYAPP_UPLOAD_KEY_PASSWORD") as String
+                  }`;
+            kts = kts.replace("signingConfigs {", "signingConfigs {" + ktsSigning);
+            kts = kts.replace(/signingConfigs\.getByName\("debug"\)/g, "signingConfigs.getByName(\"release\")");
+            kts = kts.replace(/signingConfigs\.debug/g, "signingConfigs.getByName(\"release\")");
+            const ktsSplits = `
+              splits {
+                  abi {
+                      reset()
+                      isEnable = project.hasProperty("enableAbiSplits")
+                      isUniversalApk = false
+                      include("arm64-v8a", "armeabi-v7a")
+                  }
+              }
+            `;
+            kts = kts.replace("android {", "android {" + ktsSplits);
+            fs.writeFileSync("android/app/build.gradle.kts", kts);
+          } else if (fs.existsSync("android/app/build.gradle")) {
+            let groovy = fs.readFileSync("android/app/build.gradle", "utf8");
+            const groovySigning = `
                   release {
                       if (project.hasProperty("MYAPP_UPLOAD_STORE_FILE")) {
                           storeFile file(MYAPP_UPLOAD_STORE_FILE)
@@ -125,16 +146,10 @@ jobs:
                           keyPassword MYAPP_UPLOAD_KEY_PASSWORD
                       }
                   }`;
-          content = content.replace("signingConfigs {", "signingConfigs {" + releaseSigning);
-
-          content = content.replace(
-            /buildTypes\s*\{[\s\S]*?release\s*\{[\s\S]*?signingConfig\s+signingConfigs\.debug/,
-            (match) => match.replace("signingConfigs.debug", "signingConfigs.release")
-          );
-
-          // Enable ABI splits only when -PenableAbiSplits=true is passed (for slim APK),
-          // keeping bundleRelease clean with a single unified resource table.
-          const abiSplitBlock = `
+            groovy = groovy.replace("signingConfigs {", "signingConfigs {" + groovySigning);
+            groovy = groovy.replace(/signingConfigs\.debug/g, "signingConfigs.release");
+            groovy = groovy.replace(/signingConfigs\.getByName\(['"]debug['"]\)/g, "signingConfigs.release");
+            const groovySplits = `
               splits {
                   abi {
                       reset()
@@ -143,18 +158,27 @@ jobs:
                       include "arm64-v8a", "armeabi-v7a"
                   }
               }
-          `;
-          content = content.replace("android {", "android {" + abiSplitBlock);
-
-          fs.writeFileSync(gradlePath, content);
+            `;
+            groovy = groovy.replace("android {", "android {" + groovySplits);
+            fs.writeFileSync("android/app/build.gradle", groovy);
+          }
           '
 
-      - name: Build Slim Release APK & Unified AAB with Gradle
+      - name: Build Slim Release APK & Release-Signed AAB
         run: |
           cd android
           chmod +x gradlew
           ./gradlew assembleRelease -PenableAbiSplits=true --no-daemon
           ./gradlew bundleRelease --no-daemon
+
+      - name: Verify AAB Is Signed With Release Certificate (Not Debug)
+        run: |
+          CERT_INFO=$(jarsigner -verify -verbose -certs android/app/build/outputs/bundle/release/app-release.aab)
+          echo "$CERT_INFO" | grep "CN=" | head -n 5
+          if echo "$CERT_INFO" | grep -q "Android Debug"; then
+            echo "ERROR: AAB is still signed with Android Debug key!"
+            exit 1
+          fi
 
       - name: Upload Slim ARM64 APK Artifact
         uses: actions/upload-artifact@v4
@@ -163,7 +187,7 @@ jobs:
           path: android/app/build/outputs/apk/release/app-arm64-v8a-release.apk
           if-no-files-found: error
 
-      - name: Upload Google Play AAB Artifact
+      - name: Upload Release-Signed AAB Artifact
         uses: actions/upload-artifact@v4
         with:
           name: AstroEnhancer-Android-AAB
