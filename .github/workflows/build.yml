@@ -1,4 +1,4 @@
-name: Build Android APK (Native GitHub Runner)
+name: Build Android APK and AAB (Optimized)
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
 
 jobs:
   build_android:
-    name: Build Android APK
+    name: Build Slim APK & Play Store AAB
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -102,19 +102,20 @@ jobs:
       - name: Generate Native Android Project
         run: npx expo prebuild --platform android --non-interactive
 
-      - name: Restore Release Keystore Signing
+      - name: Configure Signing, R8 Shrinking & ABI Splits
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
         run: |
           echo "$KEYSTORE_B64" | base64 --decode > android/app/release.keystore
 
-          printf "MYAPP_UPLOAD_STORE_FILE=release.keystore\nMYAPP_UPLOAD_KEY_ALIAS=astrokey\nMYAPP_UPLOAD_STORE_PASSWORD=%s\nMYAPP_UPLOAD_KEY_PASSWORD=%s\n" "$KEYSTORE_PASS" "$KEYSTORE_PASS" >> android/gradle.properties
+          printf "\nMYAPP_UPLOAD_STORE_FILE=release.keystore\nMYAPP_UPLOAD_KEY_ALIAS=astrokey\nMYAPP_UPLOAD_STORE_PASSWORD=%s\nMYAPP_UPLOAD_KEY_PASSWORD=%s\nandroid.enableMinifyInReleaseBuilds=true\nandroid.enableShrinkResourcesInReleaseBuilds=true\n" "$KEYSTORE_PASS" "$KEYSTORE_PASS" >> android/gradle.properties
 
           node -e '
           const fs = require("fs");
           const gradlePath = "android/app/build.gradle";
           let content = fs.readFileSync(gradlePath, "utf8");
+
           const releaseSigning = `
                   release {
                       if (project.hasProperty("MYAPP_UPLOAD_STORE_FILE")) {
@@ -125,22 +126,45 @@ jobs:
                       }
                   }`;
           content = content.replace("signingConfigs {", "signingConfigs {" + releaseSigning);
+
           content = content.replace(
             /buildTypes\s*\{[\s\S]*?release\s*\{[\s\S]*?signingConfig\s+signingConfigs\.debug/,
             (match) => match.replace("signingConfigs.debug", "signingConfigs.release")
           );
+
+          // Split APKs by CPU architecture so arm64-v8a phones do not download x86/32-bit native libs
+          // (Note: bundleRelease automatically ignores splits and includes all ABIs in the .aab)
+          const abiSplitBlock = `
+              splits {
+                  abi {
+                      reset()
+                      enable true
+                      universalApk false
+                      include "arm64-v8a", "armeabi-v7a"
+                  }
+              }
+          `;
+          content = content.replace("android {", "android {" + abiSplitBlock);
+
           fs.writeFileSync(gradlePath, content);
           '
 
-      - name: Build Release APK with Gradle
+      - name: Build Slim Release APK & AAB with Gradle
         run: |
           cd android
           chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon
+          ./gradlew assembleRelease bundleRelease --no-daemon
 
-      - name: Upload APK Artifact
+      - name: Upload Slim ARM64 APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AstroEnhancer-Android-APK
-          path: android/app/build/outputs/apk/release/app-release.apk
+          name: AstroEnhancer-Android-APK-arm64
+          path: android/app/build/outputs/apk/release/app-arm64-v8a-release.apk
+          if-no-files-found: error
+
+      - name: Upload Google Play AAB Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AstroEnhancer-Android-AAB
+          path: android/app/build/outputs/bundle/release/app-release.aab
           if-no-files-found: error
