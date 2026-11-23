@@ -29,9 +29,9 @@ import {
   ImageFormat,
   ImageShader,
   MipmapMode,
+  Path,
   Shader,
   SkImage,
-  SkRuntimeEffect,
   Skia,
   TileMode,
   useImage,
@@ -58,15 +58,30 @@ interface HistData {
 interface ImageAnalysis {
   autoParams: AstroParams;
   bgModel: BgCornerModel;
+  rawPixels: Uint8Array | null;
 }
 
 const CUSTOM_PRESETS_FILE = new File(Paths.document, 'astro_custom_presets.json');
 
-function readRGBA8888Pixels(snap: SkImage, width: number, height: number): Uint8Array | null {
+function sampleDownscaledRGBA(img: SkImage, size = 64): Uint8Array | null {
   try {
+    const surface = Skia.Surface.MakeOffscreen(size, size);
+    if (!surface) return null;
+
+    const canvas = surface.getCanvas();
+    const paint = Skia.Paint();
+    canvas.drawImageRect(
+      img,
+      Skia.XYWHRect(0, 0, img.width(), img.height()),
+      Skia.XYWHRect(0, 0, size, size),
+      paint
+    );
+    surface.flush();
+
+    const snap = surface.makeImageSnapshot();
     const info = {
-      width,
-      height,
+      width: size,
+      height: size,
       colorType: ColorType.RGBA_8888,
       alphaType: AlphaType.Premul,
     };
@@ -79,27 +94,103 @@ function readRGBA8888Pixels(snap: SkImage, width: number, height: number): Uint8
   }
 }
 
-function computeHistogramFromPixels(pixels: Uint8Array): HistData {
+function asinhJS(x: number, amount: number): number {
+  if (amount <= 0.001) return x;
+  const b = amount * 10.0;
+  return Math.log(b * x + Math.sqrt(b * b * x * x + 1.0)) / Math.log(b + Math.sqrt(b * b + 1.0));
+}
+
+// Computes an accurate 32-bin RGB histogram directly from cached 64x64 RGBA pixels + active parameters
+function computeHistogramFromCache(
+  rawPixels: Uint8Array | null,
+  params: AstroParams,
+  bgModel: BgCornerModel
+): HistData | null {
+  if (!rawPixels || rawPixels.length < 16) return null;
+
   const bins = 32;
   const histR = new Array(bins).fill(0);
   const histG = new Array(bins).fill(0);
   const histB = new Array(bins).fill(0);
 
-  for (let i = 0; i < pixels.length; i += 4) {
-    const r = pixels[i] / 255;
-    const g = pixels[i + 1] / 255;
-    const b = pixels[i + 2] / 255;
+  const N = Math.round(Math.sqrt(rawPixels.length / 4));
+  const minCornerR = Math.min(bgModel.tl[0], bgModel.tr[0], bgModel.bl[0], bgModel.br[0]);
+  const minCornerG = Math.min(bgModel.tl[1], bgModel.tr[1], bgModel.bl[1], bgModel.br[1]);
+  const minCornerB = Math.min(bgModel.tl[2], bgModel.tr[2], bgModel.bl[2], bgModel.br[2]);
+
+  for (let i = 0; i < rawPixels.length; i += 4) {
+    let r = rawPixels[i] / 255;
+    let g = rawPixels[i + 1] / 255;
+    let b = rawPixels[i + 2] / 255;
+
+    // 1. Approximate DBE subtraction
+    if (params.bgExtract > 0.001 && N > 1) {
+      const px = (i / 4) % N;
+      const py = Math.floor(i / 4 / N);
+      const u = px / (N - 1);
+      const v = py / (N - 1);
+      const skyR =
+        (bgModel.tl[0] * (1 - u) + bgModel.tr[0] * u) * (1 - v) +
+        (bgModel.bl[0] * (1 - u) + bgModel.br[0] * u) * v;
+      const skyG =
+        (bgModel.tl[1] * (1 - u) + bgModel.tr[1] * u) * (1 - v) +
+        (bgModel.bl[1] * (1 - u) + bgModel.br[1] * u) * v;
+      const skyB =
+        (bgModel.tl[2] * (1 - u) + bgModel.tr[2] * u) * (1 - v) +
+        (bgModel.bl[2] * (1 - u) + bgModel.br[2] * u) * v;
+      r = Math.max(0, r - Math.max(0, skyR - minCornerR) * params.bgExtract * 1.15);
+      g = Math.max(0, g - Math.max(0, skyG - minCornerG) * params.bgExtract * 1.15);
+      b = Math.max(0, b - Math.max(0, skyB - minCornerB) * params.bgExtract * 1.15);
+    }
+
+    // 2. Black point floor
+    if (params.blackPoint > 0.001) {
+      const floor = params.blackPoint * 0.75;
+      const denom = Math.max(0.05, 1 - floor);
+      r = Math.max(0, r - floor) / denom;
+      g = Math.max(0, g - floor) / denom;
+      b = Math.max(0, b - floor) / denom;
+    }
+
+    // 3. Luminance-preserving Asinh stretch
+    if (params.stretch > 0.001) {
+      const curL = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      if (curL > 0.0001) {
+        const targetL = asinhJS(curL, params.stretch);
+        const ratio = targetL / curL;
+        r *= ratio;
+        g *= ratio;
+        b *= ratio;
+      }
+    }
+
+    // 4. White Balance
+    if (Math.abs(params.temperature) > 0.001 || Math.abs(params.tint) > 0.001) {
+      r *= 1 + params.temperature * 0.35 + params.tint * 0.15;
+      g *= 1 - params.tint * 0.25;
+      b *= 1 - params.temperature * 0.35 + params.tint * 0.15;
+    }
+
+    // 5. SCNR Green Cast Removal
+    if (params.scnrGreen > 0.001) {
+      const avgRB = (r + b) * 0.5;
+      g = g + (Math.min(g, avgRB) - g) * params.scnrGreen;
+    }
+
+    r = Math.min(1, Math.max(0, r));
+    g = Math.min(1, Math.max(0, g));
+    b = Math.min(1, Math.max(0, b));
+
     histR[Math.min(bins - 1, Math.floor(r * bins))]++;
     histG[Math.min(bins - 1, Math.floor(g * bins))]++;
     histB[Math.min(bins - 1, Math.floor(b * bins))]++;
   }
 
-  // Log-scale counts so faint nebula/star midtone curves are clearly visible alongside the dark sky peak
   const logR = histR.map((v) => Math.log1p(v));
   const logG = histG.map((v) => Math.log1p(v));
   const logB = histB.map((v) => Math.log1p(v));
-
   const maxLog = Math.max(0.001, ...logR, ...logG, ...logB);
+
   return {
     r: logR.map((v) => v / maxLog),
     g: logG.map((v) => v / maxLog),
@@ -107,95 +198,16 @@ function computeHistogramFromPixels(pixels: Uint8Array): HistData {
   };
 }
 
-function computeLiveHistogram(
-  img: SkImage,
-  effect: SkRuntimeEffect | null,
-  params: AstroParams,
-  bgModel: BgCornerModel
-): HistData | null {
-  try {
-    const N = 64;
-    const surface = Skia.Surface.MakeOffscreen(N, N);
-    if (!surface) return null;
-
-    const canvas = surface.getCanvas();
-    const paint = Skia.Paint();
-
-    if (effect) {
-      const imgShader = img.makeShaderOptions(
-        TileMode.Clamp,
-        TileMode.Clamp,
-        FilterMode.Linear,
-        MipmapMode.None
-      );
-      const uniformValues = [
-        img.width(),
-        img.height(),
-        params.stretch,
-        params.blackPoint,
-        params.bgExtract,
-        params.scnrGreen,
-        params.waveletFine,
-        params.waveletMed,
-        params.denoise,
-        params.vibrance,
-        params.temperature,
-        params.tint,
-        params.starControl,
-        ...bgModel.tl,
-        ...bgModel.tr,
-        ...bgModel.bl,
-        ...bgModel.br,
-        0.0,
-      ];
-      const shader = effect.makeShaderWithChildren(uniformValues, [imgShader]);
-      paint.setShader(shader);
-      canvas.save();
-      canvas.scale(N / img.width(), N / img.height());
-      canvas.drawRect(Skia.XYWHRect(0, 0, img.width(), img.height()), paint);
-      canvas.restore();
-    } else {
-      canvas.drawImageRect(
-        img,
-        Skia.XYWHRect(0, 0, img.width(), img.height()),
-        Skia.XYWHRect(0, 0, N, N),
-        paint
-      );
-    }
-
-    surface.flush();
-    const snap = surface.makeImageSnapshot();
-    const pixels = readRGBA8888Pixels(snap, N, N);
-    if (!pixels) return null;
-    return computeHistogramFromPixels(pixels);
-  } catch {
-    return null;
-  }
-}
-
 function analyzeAstroImage(img: SkImage): ImageAnalysis {
   const defaultResult: ImageAnalysis = {
     autoParams: ASTRO_PRESETS[0].params,
     bgModel: DEFAULT_BG_MODEL,
+    rawPixels: null,
   };
 
   try {
     const N = 64;
-    const surface = Skia.Surface.MakeOffscreen(N, N);
-    if (!surface) return defaultResult;
-
-    const canvas = surface.getCanvas();
-    const paint = Skia.Paint();
-    canvas.drawImageRect(
-      img,
-      Skia.XYWHRect(0, 0, img.width(), img.height()),
-      Skia.XYWHRect(0, 0, N, N),
-      paint
-    );
-    surface.flush();
-
-    const snap = surface.makeImageSnapshot();
-    const pixels = readRGBA8888Pixels(snap, N, N);
+    const pixels = sampleDownscaledRGBA(img, N);
     if (!pixels) return defaultResult;
 
     const lumas: number[] = [];
@@ -221,12 +233,17 @@ function analyzeAstroImage(img: SkImage): ImageAnalysis {
       }
     }
 
-    const getQuadrantSky = (arr: { l: number; rgb: [number, number, number] }[]): [number, number, number] => {
+    const getQuadrantSky = (
+      arr: { l: number; rgb: [number, number, number] }[]
+    ): [number, number, number] => {
       if (arr.length === 0) return [0, 0, 0];
       arr.sort((a, b) => a.l - b.l);
       const start = Math.floor(arr.length * 0.08);
       const end = Math.max(start + 1, Math.floor(arr.length * 0.22));
-      let sr = 0, sg = 0, sb = 0, count = 0;
+      let sr = 0,
+        sg = 0,
+        sb = 0,
+        count = 0;
       for (let i = start; i < end; i++) {
         sr += arr[i].rgb[0];
         sg += arr[i].rgb[1];
@@ -252,6 +269,7 @@ function analyzeAstroImage(img: SkImage): ImageAnalysis {
 
     if (isBrightTarget) {
       return {
+        rawPixels: pixels,
         bgModel: DEFAULT_BG_MODEL,
         autoParams: {
           stretch: 0.18,
@@ -273,6 +291,7 @@ function analyzeAstroImage(img: SkImage): ImageAnalysis {
     const autoBlack = Math.min(0.2, Math.max(0.02, Number((p10 * 0.8).toFixed(2))));
 
     return {
+      rawPixels: pixels,
       bgModel,
       autoParams: {
         stretch: autoStretch,
@@ -293,6 +312,19 @@ function analyzeAstroImage(img: SkImage): ImageAnalysis {
   }
 }
 
+function buildCurvePath(values: number[], width: number, height: number): string {
+  if (values.length === 0) return '';
+  const stepX = width / (values.length - 1);
+  let d = `M 0 ${height}`;
+  for (let i = 0; i < values.length; i++) {
+    const x = i * stepX;
+    const y = height - Math.min(1, Math.max(0, values[i])) * (height - 4) - 2;
+    d += ` L ${x.toFixed(1)} ${y.toFixed(1)}`;
+  }
+  d += ` L ${width} ${height} Z`;
+  return d;
+}
+
 export default function App() {
   return (
     <SafeAreaProvider>
@@ -311,7 +343,10 @@ function AstroEditorScreen() {
   const [customPresets, setCustomPresets] = useState<AstroPreset[]>([]);
   const [params, setParams] = useState<AstroParams>(ASTRO_PRESETS[0].params);
   const [bgModel, setBgModel] = useState<BgCornerModel>(DEFAULT_BG_MODEL);
-  const [histData, setHistData] = useState<HistData | null>(null);
+  const [rawPixels, setRawPixels] = useState<Uint8Array | null>(null);
+
+  // Lock vertical ScrollView while dragging sliders or split bar
+  const [isDraggingControl, setIsDraggingControl] = useState<boolean>(false);
 
   // Viewport inspection modes
   const [showOriginal, setShowOriginal] = useState<boolean>(false);
@@ -383,6 +418,7 @@ function AstroEditorScreen() {
   useEffect(() => {
     if (skImage) {
       const analysis = analyzeAstroImage(skImage);
+      setRawPixels(analysis.rawPixels);
       setBgModel(analysis.bgModel);
       setActivePresetId('auto_pro');
       setParams(analysis.autoParams);
@@ -398,12 +434,11 @@ function AstroEditorScreen() {
   const originalPreset = ASTRO_PRESETS[ASTRO_PRESETS.length - 1];
   const activeParams = showOriginal ? originalPreset.params : params;
 
-  // Recompute live RGB histogram whenever Hist HUD is visible and sliders/presets change
-  useEffect(() => {
-    if (!skImage || !showHistogram) return;
-    const h = computeLiveHistogram(skImage, runtimeEffect, activeParams, bgModel);
-    if (h) setHistData(h);
-  }, [skImage, runtimeEffect, activeParams, bgModel, showHistogram]);
+  // Live histogram computed instantly from cached 64x64 pixels + current slider parameters
+  const histData = useMemo(() => {
+    if (!showHistogram) return null;
+    return computeHistogramFromCache(rawPixels, activeParams, bgModel);
+  }, [showHistogram, rawPixels, activeParams, bgModel]);
 
   const cropRect = useMemo(() => {
     if (!skImage) return { x: 0, y: 0, w: 100, h: 100 };
@@ -487,12 +522,16 @@ function AstroEditorScreen() {
     return Math.hypot(dx, dy);
   };
 
+  const splitEnabledRef = useRef(splitEnabled);
+  splitEnabledRef.current = splitEnabled;
+
   const viewportPanResponder = useMemo(
     () =>
       PanResponder.create({
-        onStartShouldSetPanResponder: () => !splitEnabled,
+        onStartShouldSetPanResponder: () => !splitEnabledRef.current,
         onMoveShouldSetPanResponder: (_, gs) =>
-          !splitEnabled && (Math.abs(gs.dx) > 2 || Math.abs(gs.dy) > 2 || gs.numberActiveTouches >= 2),
+          !splitEnabledRef.current &&
+          (Math.abs(gs.dx) > 2 || Math.abs(gs.dy) > 2 || gs.numberActiveTouches >= 2),
         onPanResponderGrant: (evt: GestureResponderEvent) => {
           const touches = evt.nativeEvent.touches;
           gestureStartRef.current = {
@@ -539,28 +578,40 @@ function AstroEditorScreen() {
           gestureStartRef.current.isPinching = false;
         },
       }),
-    [clampPan, maxZoom, splitEnabled]
+    [clampPan, maxZoom]
   );
 
+  // Stable Split-Screen Wipe Responder (uses refs so it is NEVER recreated mid-drag)
+  const splitRatioRef = useRef(0.5);
   const splitStartRef = useRef(0.5);
-  const splitPanResponder = useMemo(
-    () =>
-      PanResponder.create({
-        onStartShouldSetPanResponder: () => true,
-        onMoveShouldSetPanResponder: () => true,
-        onPanResponderGrant: () => {
-          splitStartRef.current = splitRatio;
-        },
-        onPanResponderMove: (_, gs) => {
-          const next = Math.min(
-            0.95,
-            Math.max(0.05, splitStartRef.current + gs.dx / Math.max(1, canvasDimensions.width))
-          );
-          setSplitRatio(next);
-        },
-      }),
-    [splitRatio, canvasDimensions.width]
-  );
+  const canvasWidthRef = useRef(canvasDimensions.width);
+  canvasWidthRef.current = canvasDimensions.width;
+
+  const splitPanResponder = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onStartShouldSetPanResponderCapture: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponderCapture: () => true,
+      onPanResponderTerminationRequest: () => false,
+      onPanResponderGrant: () => {
+        splitStartRef.current = splitRatioRef.current;
+        setIsDraggingControl(true);
+      },
+      onPanResponderMove: (_, gs) => {
+        const w = Math.max(1, canvasWidthRef.current);
+        const next = Math.min(0.95, Math.max(0.05, splitStartRef.current + gs.dx / w));
+        splitRatioRef.current = next;
+        setSplitRatio(next);
+      },
+      onPanResponderRelease: () => {
+        setIsDraggingControl(false);
+      },
+      onPanResponderTerminate: () => {
+        setIsDraggingControl(false);
+      },
+    })
+  ).current;
 
   const pickImage = async () => {
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
@@ -805,6 +856,9 @@ function AstroEditorScreen() {
     return Math.max(effW / cropRect.w, effH / cropRect.h) * fineFillScale;
   }, [skImage, quarterTurns, cropRect, fineFillScale]);
 
+  const histW = 112;
+  const histH = 48;
+
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
       <StatusBar style="light" backgroundColor="#070A12" />
@@ -825,12 +879,13 @@ function AstroEditorScreen() {
           {skImage && runtimeEffect ? (
             <>
               <View
-                {...viewportPanResponder.panHandlers}
+                {...(!splitEnabled ? viewportPanResponder.panHandlers : {})}
                 style={[
                   styles.viewportClip,
                   { width: canvasDimensions.width, height: canvasDimensions.height },
                 ]}
               >
+                {/* Processed (Right side in Split mode, Full in Normal mode) */}
                 <View
                   style={{
                     width: canvasDimensions.width,
@@ -864,6 +919,7 @@ function AstroEditorScreen() {
                   </Canvas>
                 </View>
 
+                {/* Split-Screen Raw Overlay (Left Side) */}
                 {splitEnabled && (
                   <View
                     pointerEvents="none"
@@ -908,58 +964,40 @@ function AstroEditorScreen() {
                   </View>
                 )}
 
+                {/* Draggable Split Wipe Handle (Wide 52px Touch Target) */}
                 {splitEnabled && (
                   <View
                     {...splitPanResponder.panHandlers}
                     style={[
                       styles.splitLineWrap,
-                      { left: canvasDimensions.width * splitRatio - 16 },
+                      { left: canvasDimensions.width * splitRatio - 26 },
                     ]}
                   >
                     <View style={styles.splitLine} />
                     <View style={styles.splitHandle}>
-                      <Text style={styles.splitHandleText}>◀▶</Text>
+                      <Text style={styles.splitHandleText}>◀ ▶</Text>
                     </View>
                   </View>
                 )}
 
-                {/* Live RGB Histogram HUD */}
+                {/* Live Skia RGB Curve Histogram HUD */}
                 {showHistogram && histData && (
                   <View pointerEvents="none" style={styles.histBox}>
-                    <View style={styles.histBars}>
-                      {histData.r.map((_, i) => (
-                        <View key={i} style={styles.histCol}>
-                          <View
-                            style={[
-                              styles.histBar,
-                              {
-                                height: Math.max(2, histData.b[i] * 44),
-                                backgroundColor: 'rgba(56,189,248,0.65)',
-                              },
-                            ]}
-                          />
-                          <View
-                            style={[
-                              styles.histBar,
-                              {
-                                height: Math.max(2, histData.g[i] * 44),
-                                backgroundColor: 'rgba(74,222,128,0.55)',
-                              },
-                            ]}
-                          />
-                          <View
-                            style={[
-                              styles.histBar,
-                              {
-                                height: Math.max(2, histData.r[i] * 44),
-                                backgroundColor: 'rgba(248,113,113,0.55)',
-                              },
-                            ]}
-                          />
-                        </View>
-                      ))}
-                    </View>
-                    <Text style={styles.histLabel}>RGB HISTOGRAM (LOG)</Text>
+                    <Canvas style={{ width: histW, height: histH }}>
+                      <Path
+                        path={buildCurvePath(histData.b, histW, histH)}
+                        color="rgba(56, 189, 248, 0.45)"
+                      />
+                      <Path
+                        path={buildCurvePath(histData.g, histW, histH)}
+                        color="rgba(74, 222, 128, 0.45)"
+                      />
+                      <Path
+                        path={buildCurvePath(histData.r, histW, histH)}
+                        color="rgba(248, 113, 113, 0.45)"
+                      />
+                    </Canvas>
+                    <Text style={styles.histLabel}>RGB HISTOGRAM</Text>
                   </View>
                 )}
               </View>
@@ -1059,7 +1097,11 @@ function AstroEditorScreen() {
             </Pressable>
           </View>
 
-          <ScrollView style={styles.middleScroll} contentContainerStyle={styles.middleScrollContent}>
+          <ScrollView
+            style={styles.middleScroll}
+            contentContainerStyle={styles.middleScrollContent}
+            scrollEnabled={!isDraggingControl}
+          >
             {activeTab === 'presets' && (
               <>
                 <View style={styles.presetHeaderRow}>
@@ -1096,6 +1138,7 @@ function AstroEditorScreen() {
                   value={params.stretch}
                   min={0}
                   max={1}
+                  onDragStateChange={setIsDraggingControl}
                   onChange={(v) => updateParamValue('stretch', v)}
                 />
                 <SliderRow
@@ -1103,6 +1146,7 @@ function AstroEditorScreen() {
                   value={params.blackPoint}
                   min={0}
                   max={0.35}
+                  onDragStateChange={setIsDraggingControl}
                   onChange={(v) => updateParamValue('blackPoint', v)}
                 />
                 <SliderRow
@@ -1110,6 +1154,7 @@ function AstroEditorScreen() {
                   value={params.bgExtract}
                   min={0}
                   max={1}
+                  onDragStateChange={setIsDraggingControl}
                   onChange={(v) => updateParamValue('bgExtract', v)}
                 />
                 <SliderRow
@@ -1117,6 +1162,7 @@ function AstroEditorScreen() {
                   value={params.scnrGreen}
                   min={0}
                   max={1}
+                  onDragStateChange={setIsDraggingControl}
                   onChange={(v) => updateParamValue('scnrGreen', v)}
                 />
                 <SliderRow
@@ -1124,6 +1170,7 @@ function AstroEditorScreen() {
                   value={params.starControl}
                   min={0}
                   max={1}
+                  onDragStateChange={setIsDraggingControl}
                   onChange={(v) => updateParamValue('starControl', v)}
                 />
                 <SliderRow
@@ -1131,6 +1178,7 @@ function AstroEditorScreen() {
                   value={params.waveletFine}
                   min={0}
                   max={1.5}
+                  onDragStateChange={setIsDraggingControl}
                   onChange={(v) => updateParamValue('waveletFine', v)}
                 />
                 <SliderRow
@@ -1138,6 +1186,7 @@ function AstroEditorScreen() {
                   value={params.waveletMed}
                   min={0}
                   max={1.5}
+                  onDragStateChange={setIsDraggingControl}
                   onChange={(v) => updateParamValue('waveletMed', v)}
                 />
                 <SliderRow
@@ -1145,6 +1194,7 @@ function AstroEditorScreen() {
                   value={params.vibrance}
                   min={0}
                   max={1.5}
+                  onDragStateChange={setIsDraggingControl}
                   onChange={(v) => updateParamValue('vibrance', v)}
                 />
                 <SliderRow
@@ -1153,6 +1203,7 @@ function AstroEditorScreen() {
                   min={-0.5}
                   max={0.5}
                   signed
+                  onDragStateChange={setIsDraggingControl}
                   onChange={(v) => updateParamValue('temperature', v)}
                 />
                 <SliderRow
@@ -1161,6 +1212,7 @@ function AstroEditorScreen() {
                   min={-0.5}
                   max={0.5}
                   signed
+                  onDragStateChange={setIsDraggingControl}
                   onChange={(v) => updateParamValue('tint', v)}
                 />
                 <SliderRow
@@ -1169,6 +1221,7 @@ function AstroEditorScreen() {
                   min={0}
                   max={1}
                   isLast
+                  onDragStateChange={setIsDraggingControl}
                   onChange={(v) => updateParamValue('denoise', v)}
                 />
               </View>
@@ -1239,6 +1292,7 @@ function AstroEditorScreen() {
                   max={15}
                   unit="°"
                   isLast
+                  onDragStateChange={setIsDraggingControl}
                   onChange={(v) => setFineAngle(Number(v.toFixed(1)))}
                 />
               </View>
@@ -1330,6 +1384,7 @@ function SliderRow({
   signed = false,
   unit = '%',
   isLast = false,
+  onDragStateChange,
   onChange,
 }: {
   label: string;
@@ -1339,40 +1394,47 @@ function SliderRow({
   signed?: boolean;
   unit?: string;
   isLast?: boolean;
+  onDragStateChange?: (dragging: boolean) => void;
   onChange: (val: number) => void;
 }) {
   const trackWidthRef = useRef(1);
-  const startRatioRef = useRef(0);
+  const minRef = useRef(min);
+  const maxRef = useRef(max);
+  const onChangeRef = useRef(onChange);
+  const onDragRef = useRef(onDragStateChange);
+  minRef.current = min;
+  maxRef.current = max;
+  onChangeRef.current = onChange;
+  onDragRef.current = onDragStateChange;
 
   const ratio = Math.min(1, Math.max(0, (value - min) / (max - min)));
 
-  const updateFromRatio = useCallback(
-    (r: number) => {
-      const clamped = Math.min(1, Math.max(0, r));
-      const mapped = min + clamped * (max - min);
-      onChange(mapped);
-    },
-    [min, max, onChange]
-  );
-
-  const panResponder = useMemo(
-    () =>
-      PanResponder.create({
-        onStartShouldSetPanResponder: () => true,
-        onMoveShouldSetPanResponder: () => true,
-        onPanResponderGrant: (evt) => {
-          const touchX = evt.nativeEvent.locationX;
-          const clickedRatio = touchX / Math.max(1, trackWidthRef.current);
-          startRatioRef.current = clickedRatio;
-          updateFromRatio(clickedRatio);
-        },
-        onPanResponderMove: (_, gs) => {
-          const deltaRatio = gs.dx / Math.max(1, trackWidthRef.current);
-          updateFromRatio(startRatioRef.current + deltaRatio);
-        },
-      }),
-    [updateFromRatio]
-  );
+  const panResponder = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onStartShouldSetPanResponderCapture: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponderCapture: () => true,
+      onPanResponderTerminationRequest: () => false,
+      onPanResponderGrant: (evt) => {
+        onDragRef.current?.(true);
+        const w = Math.max(1, trackWidthRef.current);
+        const r = Math.min(1, Math.max(0, evt.nativeEvent.locationX / w));
+        onChangeRef.current(minRef.current + r * (maxRef.current - minRef.current));
+      },
+      onPanResponderMove: (evt) => {
+        const w = Math.max(1, trackWidthRef.current);
+        const r = Math.min(1, Math.max(0, evt.nativeEvent.locationX / w));
+        onChangeRef.current(minRef.current + r * (maxRef.current - minRef.current));
+      },
+      onPanResponderRelease: () => {
+        onDragRef.current?.(false);
+      },
+      onPanResponderTerminate: () => {
+        onDragRef.current?.(false);
+      },
+    })
+  ).current;
 
   const onTrackLayout = (e: LayoutChangeEvent) => {
     trackWidthRef.current = e.nativeEvent.layout.width;
@@ -1393,6 +1455,7 @@ function SliderRow({
         <Text style={styles.stepVal}>{displayVal}</Text>
       </View>
       <View
+        pointerEvents="box-only"
         style={styles.sliderTouchArea}
         onLayout={onTrackLayout}
         {...panResponder.panHandlers}
@@ -1465,28 +1528,29 @@ const styles = StyleSheet.create({
     position: 'absolute',
     top: 0,
     bottom: 0,
-    width: 32,
+    width: 52,
     alignItems: 'center',
     justifyContent: 'center',
+    zIndex: 20,
   },
   splitLine: {
     position: 'absolute',
     top: 0,
     bottom: 0,
-    width: 2,
+    width: 2.5,
     backgroundColor: '#38BDF8',
   },
   splitHandle: {
     backgroundColor: '#0F172A',
     borderColor: '#38BDF8',
-    borderWidth: 1.5,
-    paddingHorizontal: 5,
-    paddingVertical: 3,
-    borderRadius: 10,
+    borderWidth: 2,
+    paddingHorizontal: 7,
+    paddingVertical: 5,
+    borderRadius: 14,
   },
   splitHandleText: {
     color: '#F8FAFC',
-    fontSize: 9,
+    fontSize: 10,
     fontWeight: '700',
   },
   histBox: {
@@ -1498,24 +1562,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderRadius: 8,
     padding: 6,
-  },
-  histBars: {
-    flexDirection: 'row',
-    alignItems: 'flex-end',
-    height: 44,
-    gap: 1.5,
-  },
-  histCol: {
-    width: 3,
-    height: 44,
-    justifyContent: 'flex-end',
-  },
-  histBar: {
-    position: 'absolute',
-    bottom: 0,
-    width: 3,
-    borderTopLeftRadius: 1,
-    borderTopRightRadius: 1,
+    zIndex: 10,
   },
   histLabel: {
     color: '#CBD5E1',
@@ -1722,12 +1769,12 @@ const styles = StyleSheet.create({
     fontSize: 12,
   },
   sliderTouchArea: {
-    height: 26,
+    height: 30,
     justifyContent: 'center',
     position: 'relative',
   },
   sliderTrack: {
-    height: 5,
+    height: 6,
     borderRadius: 3,
     backgroundColor: '#1E293B',
     overflow: 'hidden',
@@ -1738,13 +1785,13 @@ const styles = StyleSheet.create({
   },
   sliderThumb: {
     position: 'absolute',
-    width: 18,
-    height: 18,
-    borderRadius: 9,
+    width: 20,
+    height: 20,
+    borderRadius: 10,
     backgroundColor: '#F8FAFC',
     borderWidth: 2.5,
     borderColor: '#38BDF8',
-    marginLeft: -9,
+    marginLeft: -10,
   },
   pinnedBottom: {
     paddingHorizontal: 12,
