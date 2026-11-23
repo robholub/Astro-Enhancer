@@ -148,7 +148,8 @@ jobs:
                   }`;
             groovy = groovy.replace("signingConfigs {", "signingConfigs {" + groovySigning);
             groovy = groovy.replace(/signingConfigs\.debug/g, "signingConfigs.release");
-            groovy = groovy.replace(/signingConfigs\.getByName\(['"]debug['"]\)/g, "signingConfigs.release");
+            groovy = groovy.replace(/signingConfigs\.getByName\(\x27debug\x27\)/g, "signingConfigs.release");
+            groovy = groovy.replace(/signingConfigs\.getByName\("debug"\)/g, "signingConfigs.release");
             const groovySplits = `
               splits {
                   abi {
