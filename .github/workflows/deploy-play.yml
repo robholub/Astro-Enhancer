@@ -1,0 +1,35 @@
+name: Upload AAB to Google Play (Internal Testing)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Optional Build Workflow Run ID (leave blank to use latest build)"
+        required: false
+        default: ""
+
+jobs:
+  deploy_internal:
+    name: Upload to Play Console Internal Track
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Download Latest Release-Signed AAB Artifact
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: build.yml
+          workflow_conclusion: success
+          run_id: ${{ github.event.inputs.run_id }}
+          name: AstroEnhancer-Android-AAB
+          path: release-aab
+
+      - name: Upload AAB to Google Play Internal Testing
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: com.astroenhancer.app
+          releaseFiles: release-aab/app-release.aab
+          track: internal
+          status: completed
