@@ -21,15 +21,12 @@ import * as MediaLibrary from 'expo-media-library';
 import * as Sharing from 'expo-sharing';
 import { File, Paths } from 'expo-file-system';
 import {
-  AlphaType,
   Canvas,
-  ColorType,
   Fill,
   FilterMode,
   ImageFormat,
   ImageShader,
   MipmapMode,
-  Path,
   Shader,
   SkImage,
   Skia,
@@ -42,12 +39,15 @@ import {
   AstroParams,
   AstroPreset,
   BgCornerModel,
+  CurvePoints,
   DEFAULT_BG_MODEL,
+  DEFAULT_CURVES,
 } from './src/astroShader';
 
 type CropAspect = 'original' | '1:1' | '4:5' | '16:9';
 type ExportFormat = 'png' | 'jpeg';
-type EditorTab = 'tune' | 'crop' | 'presets';
+type EditorTab = 'tune' | 'curves' | 'presets' | 'crop';
+type CurveChannel = 'rgb' | 'r' | 'g' | 'b';
 
 interface HistData {
   r: number[];
@@ -65,7 +65,8 @@ const CUSTOM_PRESETS_FILE = new File(Paths.document, 'astro_custom_presets.json'
 
 function sampleDownscaledRGBA(img: SkImage, size = 64): Uint8Array | null {
   try {
-    const surface = Skia.Surface.MakeOffscreen(size, size);
+    // Try CPU raster surface first for 100% reliable readPixels on all Android GPUs, then GPU offscreen
+    const surface = Skia.Surface.Make(size, size) || Skia.Surface.MakeOffscreen(size, size);
     if (!surface) return null;
 
     const canvas = surface.getCanvas();
@@ -79,15 +80,16 @@ function sampleDownscaledRGBA(img: SkImage, size = 64): Uint8Array | null {
     surface.flush();
 
     const snap = surface.makeImageSnapshot();
-    const info = {
-      width: size,
-      height: size,
-      colorType: ColorType.RGBA_8888,
-      alphaType: AlphaType.Premul,
-    };
-    const raw = snap.readPixels(0, 0, info);
+    const raw = snap.readPixels();
     if (!raw) return null;
     if (raw instanceof Uint8Array) return raw;
+    if (raw instanceof Float32Array) {
+      const out = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i++) {
+        out[i] = Math.min(255, Math.max(0, Math.round(raw[i] * 255)));
+      }
+      return out;
+    }
     return new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
   } catch {
     return null;
@@ -96,19 +98,49 @@ function sampleDownscaledRGBA(img: SkImage, size = 64): Uint8Array | null {
 
 function asinhJS(x: number, amount: number): number {
   if (amount <= 0.001) return x;
-  const b = amount * 10.0;
+  const b = amount * 12.0;
   return Math.log(b * x + Math.sqrt(b * b * x * x + 1.0)) / Math.log(b + Math.sqrt(b * b + 1.0));
 }
 
-// Computes an accurate 32-bin RGB histogram directly from cached 64x64 RGBA pixels + active parameters
+function evalSpline5JS(
+  x: number,
+  pts: [number, number, number, number, number]
+): number {
+  const c = Math.min(1, Math.max(0, x));
+  const t = c * 4.0;
+  const smooth = (u: number) => u * u * (3 - 2 * u);
+  if (t <= 1.0) {
+    const s = smooth(t);
+    return pts[0] + (pts[1] - pts[0]) * (t * 0.55 + s * 0.45);
+  } else if (t <= 2.0) {
+    const u = t - 1.0;
+    const s = smooth(u);
+    return pts[1] + (pts[2] - pts[1]) * (u * 0.55 + s * 0.45);
+  } else if (t <= 3.0) {
+    const u = t - 2.0;
+    const s = smooth(u);
+    return pts[2] + (pts[3] - pts[2]) * (u * 0.55 + s * 0.45);
+  } else {
+    const u = t - 3.0;
+    const s = smooth(u);
+    return pts[3] + (pts[4] - pts[3]) * (u * 0.55 + s * 0.45);
+  }
+}
+
 function computeHistogramFromCache(
   rawPixels: Uint8Array | null,
   params: AstroParams,
   bgModel: BgCornerModel
-): HistData | null {
-  if (!rawPixels || rawPixels.length < 16) return null;
+): HistData {
+  const bins = 28;
+  const fallback: HistData = {
+    r: new Array(bins).fill(0.15),
+    g: new Array(bins).fill(0.15),
+    b: new Array(bins).fill(0.15),
+  };
 
-  const bins = 32;
+  if (!rawPixels || rawPixels.length < 16) return fallback;
+
   const histR = new Array(bins).fill(0);
   const histG = new Array(bins).fill(0);
   const histB = new Array(bins).fill(0);
@@ -123,7 +155,6 @@ function computeHistogramFromCache(
     let g = rawPixels[i + 1] / 255;
     let b = rawPixels[i + 2] / 255;
 
-    // 1. Approximate DBE subtraction
     if (params.bgExtract > 0.001 && N > 1) {
       const px = (i / 4) % N;
       const py = Math.floor(i / 4 / N);
@@ -143,7 +174,6 @@ function computeHistogramFromCache(
       b = Math.max(0, b - Math.max(0, skyB - minCornerB) * params.bgExtract * 1.15);
     }
 
-    // 2. Black point floor
     if (params.blackPoint > 0.001) {
       const floor = params.blackPoint * 0.75;
       const denom = Math.max(0.05, 1 - floor);
@@ -152,7 +182,6 @@ function computeHistogramFromCache(
       b = Math.max(0, b - floor) / denom;
     }
 
-    // 3. Luminance-preserving Asinh stretch
     if (params.stretch > 0.001) {
       const curL = 0.2126 * r + 0.7152 * g + 0.0722 * b;
       if (curL > 0.0001) {
@@ -164,14 +193,17 @@ function computeHistogramFromCache(
       }
     }
 
-    // 4. White Balance
+    const curves = params.curves || DEFAULT_CURVES;
+    r = evalSpline5JS(evalSpline5JS(r, curves.r), curves.rgb);
+    g = evalSpline5JS(evalSpline5JS(g, curves.g), curves.rgb);
+    b = evalSpline5JS(evalSpline5JS(b, curves.b), curves.rgb);
+
     if (Math.abs(params.temperature) > 0.001 || Math.abs(params.tint) > 0.001) {
       r *= 1 + params.temperature * 0.35 + params.tint * 0.15;
       g *= 1 - params.tint * 0.25;
       b *= 1 - params.temperature * 0.35 + params.tint * 0.15;
     }
 
-    // 5. SCNR Green Cast Removal
     if (params.scnrGreen > 0.001) {
       const avgRB = (r + b) * 0.5;
       g = g + (Math.min(g, avgRB) - g) * params.scnrGreen;
@@ -261,34 +293,41 @@ function analyzeAstroImage(img: SkImage): ImageAnalysis {
     };
 
     lumas.sort((a, b) => a - b);
-    const p10 = lumas[Math.floor(lumas.length * 0.1)] ?? 0.05;
+    const p08 = lumas[Math.floor(lumas.length * 0.08)] ?? 0.05;
     const p50 = lumas[Math.floor(lumas.length * 0.5)] ?? 0.15;
     const p95 = lumas[Math.floor(lumas.length * 0.95)] ?? 0.75;
 
-    const isBrightTarget = p50 > 0.32 || (p10 < 0.04 && p95 > 0.78);
+    const isBrightTarget = p50 > 0.34 || (p08 < 0.04 && p95 > 0.78);
 
     if (isBrightTarget) {
       return {
         rawPixels: pixels,
         bgModel: DEFAULT_BG_MODEL,
         autoParams: {
-          stretch: 0.18,
-          blackPoint: Math.min(0.08, Math.max(0.01, Number((p10 * 0.7).toFixed(2)))),
+          stretch: 0.22,
+          blackPoint: Math.min(0.08, Math.max(0.01, Number((p08 * 0.75).toFixed(2)))),
           bgExtract: 0.0,
-          scnrGreen: 0.35,
-          waveletFine: 1.05,
-          waveletMed: 0.7,
+          scnrGreen: 0.4,
+          waveletFine: 1.15,
+          waveletMed: 0.78,
           denoise: 0.45,
-          vibrance: 0.3,
+          vibrance: 0.35,
           temperature: 0.0,
           tint: 0.0,
           starControl: 0.0,
+          curves: {
+            rgb: [0.0, 0.21, 0.53, 0.81, 1.0],
+            r: [0.0, 0.25, 0.5, 0.75, 1.0],
+            g: [0.0, 0.25, 0.5, 0.75, 1.0],
+            b: [0.0, 0.25, 0.5, 0.75, 1.0],
+          },
         },
       };
     }
 
-    const autoStretch = Math.min(0.7, Math.max(0.28, Number((0.68 - p50 * 1.4).toFixed(2))));
-    const autoBlack = Math.min(0.2, Math.max(0.02, Number((p10 * 0.8).toFixed(2))));
+    // Stronger, punchy Auto Pro deep-sky calibration
+    const autoStretch = Math.min(0.84, Math.max(0.45, Number((0.88 - p50 * 1.45).toFixed(2))));
+    const autoBlack = Math.min(0.24, Math.max(0.03, Number((p08 * 0.92).toFixed(2))));
 
     return {
       rawPixels: pixels,
@@ -296,33 +335,26 @@ function analyzeAstroImage(img: SkImage): ImageAnalysis {
       autoParams: {
         stretch: autoStretch,
         blackPoint: autoBlack,
-        bgExtract: 0.8,
-        scnrGreen: 0.6,
-        waveletFine: 0.42,
-        waveletMed: 0.35,
-        denoise: 0.68,
-        vibrance: 0.42,
-        temperature: 0.0,
+        bgExtract: 0.88,
+        scnrGreen: 0.68,
+        waveletFine: 0.5,
+        waveletMed: 0.48,
+        denoise: 0.7,
+        vibrance: 0.58,
+        temperature: 0.02,
         tint: 0.0,
-        starControl: 0.38,
+        starControl: 0.44,
+        curves: {
+          rgb: [0.0, 0.2, 0.55, 0.82, 1.0],
+          r: [0.0, 0.25, 0.51, 0.76, 1.0],
+          g: [0.0, 0.25, 0.5, 0.75, 1.0],
+          b: [0.0, 0.25, 0.51, 0.76, 1.0],
+        },
       },
     };
   } catch {
     return defaultResult;
   }
-}
-
-function buildCurvePath(values: number[], width: number, height: number): string {
-  if (values.length === 0) return '';
-  const stepX = width / (values.length - 1);
-  let d = `M 0 ${height}`;
-  for (let i = 0; i < values.length; i++) {
-    const x = i * stepX;
-    const y = height - Math.min(1, Math.max(0, values[i])) * (height - 4) - 2;
-    d += ` L ${x.toFixed(1)} ${y.toFixed(1)}`;
-  }
-  d += ` L ${width} ${height} Z`;
-  return d;
 }
 
 export default function App() {
@@ -339,13 +371,13 @@ function AstroEditorScreen() {
 
   const [imageUri, setImageUri] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<EditorTab>('tune');
+  const [activeCurveChannel, setActiveCurveChannel] = useState<CurveChannel>('rgb');
   const [activePresetId, setActivePresetId] = useState<string>('auto_pro');
   const [customPresets, setCustomPresets] = useState<AstroPreset[]>([]);
   const [params, setParams] = useState<AstroParams>(ASTRO_PRESETS[0].params);
   const [bgModel, setBgModel] = useState<BgCornerModel>(DEFAULT_BG_MODEL);
   const [rawPixels, setRawPixels] = useState<Uint8Array | null>(null);
 
-  // Lock vertical ScrollView while dragging sliders or split bar
   const [isDraggingControl, setIsDraggingControl] = useState<boolean>(false);
 
   // Viewport inspection modes
@@ -390,7 +422,16 @@ function AstroEditorScreen() {
         const text = CUSTOM_PRESETS_FILE.textSync();
         const parsed = JSON.parse(text);
         if (Array.isArray(parsed)) {
-          setCustomPresets(parsed);
+          // Ensure older saved presets have default curves
+          const migrated = parsed.map((p: AstroPreset) => ({
+            ...p,
+            params: {
+              ...ASTRO_PRESETS[0].params,
+              ...p.params,
+              curves: p.params?.curves ?? DEFAULT_CURVES,
+            },
+          }));
+          setCustomPresets(migrated);
         }
       }
     } catch {
@@ -434,11 +475,9 @@ function AstroEditorScreen() {
   const originalPreset = ASTRO_PRESETS[ASTRO_PRESETS.length - 1];
   const activeParams = showOriginal ? originalPreset.params : params;
 
-  // Live histogram computed instantly from cached 64x64 pixels + current slider parameters
   const histData = useMemo(() => {
-    if (!showHistogram) return null;
     return computeHistogramFromCache(rawPixels, activeParams, bgModel);
-  }, [showHistogram, rawPixels, activeParams, bgModel]);
+  }, [rawPixels, activeParams, bgModel]);
 
   const cropRect = useMemo(() => {
     if (!skImage) return { x: 0, y: 0, w: 100, h: 100 };
@@ -581,7 +620,6 @@ function AstroEditorScreen() {
     [clampPan, maxZoom]
   );
 
-  // Stable Split-Screen Wipe Responder (uses refs so it is NEVER recreated mid-drag)
   const splitRatioRef = useRef(0.5);
   const splitStartRef = useRef(0.5);
   const canvasWidthRef = useRef(canvasDimensions.width);
@@ -643,19 +681,60 @@ function AstroEditorScreen() {
         return;
       }
       setActivePresetId(preset.id);
-      setParams({ ...preset.params });
+      setParams({
+        ...preset.params,
+        curves: {
+          rgb: [...preset.params.curves.rgb],
+          r: [...preset.params.curves.r],
+          g: [...preset.params.curves.g],
+          b: [...preset.params.curves.b],
+        },
+      });
       setShowOriginal(false);
       setRenderTick((t) => t + 1);
     },
     [skImage]
   );
 
-  const updateParamValue = useCallback((key: keyof AstroParams, newVal: number) => {
+  const updateParamValue = useCallback((key: keyof Omit<AstroParams, 'curves'>, newVal: number) => {
     setActivePresetId('custom');
     setShowOriginal(false);
     setParams((prev) => ({
       ...prev,
       [key]: Number(newVal.toFixed(2)),
+    }));
+    setRenderTick((t) => t + 1);
+  }, []);
+
+  const updateCurvePoint = useCallback(
+    (channel: CurveChannel, pointIndex: number, newVal: number) => {
+      setActivePresetId('custom');
+      setShowOriginal(false);
+      setParams((prev) => {
+        const nextArr = [...prev.curves[channel]] as [number, number, number, number, number];
+        nextArr[pointIndex] = Number(Math.min(1, Math.max(0, newVal)).toFixed(2));
+        return {
+          ...prev,
+          curves: {
+            ...prev.curves,
+            [channel]: nextArr,
+          },
+        };
+      });
+      setRenderTick((t) => t + 1);
+    },
+    []
+  );
+
+  const resetCurveChannel = useCallback((channel: CurveChannel) => {
+    setActivePresetId('custom');
+    setShowOriginal(false);
+    setParams((prev) => ({
+      ...prev,
+      curves: {
+        ...prev.curves,
+        [channel]: [0.0, 0.25, 0.5, 0.75, 1.0],
+      },
     }));
     setRenderTick((t) => t + 1);
   }, []);
@@ -671,7 +750,15 @@ function AstroEditorScreen() {
       name: trimmed,
       description: 'Saved custom profile',
       isCustom: true,
-      params: { ...params },
+      params: {
+        ...params,
+        curves: {
+          rgb: [...params.curves.rgb],
+          r: [...params.curves.r],
+          g: [...params.curves.g],
+          b: [...params.curves.b],
+        },
+      },
     };
     persistCustomPresets([created, ...customPresets]);
     setActivePresetId(created.id);
@@ -716,6 +803,7 @@ function AstroEditorScreen() {
       MipmapMode.None
     );
 
+    const c = params.curves || DEFAULT_CURVES;
     const uniformValues = [
       skImage.width(),
       skImage.height(),
@@ -735,6 +823,10 @@ function AstroEditorScreen() {
       ...bgModel.bl,
       ...bgModel.br,
       0.0,
+      ...c.rgb,
+      ...c.r,
+      ...c.g,
+      ...c.b,
     ];
 
     const finalShader = runtimeEffect.makeShaderWithChildren(uniformValues, [imgShader]);
@@ -812,25 +904,48 @@ function AstroEditorScreen() {
     }
   };
 
-  const buildUniformObj = (p: AstroParams, clipFlag: boolean) => ({
-    resolution: [canvasDimensions.width, canvasDimensions.height],
-    stretch: p.stretch,
-    blackPoint: p.blackPoint,
-    bgExtract: p.bgExtract,
-    scnrGreen: p.scnrGreen,
-    waveletFine: p.waveletFine,
-    waveletMed: p.waveletMed,
-    denoise: p.denoise,
-    vibrance: p.vibrance,
-    temperature: p.temperature,
-    tint: p.tint,
-    starControl: p.starControl,
-    bgTL: bgModel.tl,
-    bgTR: bgModel.tr,
-    bgBL: bgModel.bl,
-    bgBR: bgModel.br,
-    showClipping: clipFlag ? 1.0 : 0.0,
-  });
+  const buildUniformObj = (p: AstroParams, clipFlag: boolean) => {
+    const c = p.curves || DEFAULT_CURVES;
+    return {
+      resolution: [canvasDimensions.width, canvasDimensions.height],
+      stretch: p.stretch,
+      blackPoint: p.blackPoint,
+      bgExtract: p.bgExtract,
+      scnrGreen: p.scnrGreen,
+      waveletFine: p.waveletFine,
+      waveletMed: p.waveletMed,
+      denoise: p.denoise,
+      vibrance: p.vibrance,
+      temperature: p.temperature,
+      tint: p.tint,
+      starControl: p.starControl,
+      bgTL: bgModel.tl,
+      bgTR: bgModel.tr,
+      bgBL: bgModel.bl,
+      bgBR: bgModel.br,
+      showClipping: clipFlag ? 1.0 : 0.0,
+      curveRGB0: c.rgb[0],
+      curveRGB1: c.rgb[1],
+      curveRGB2: c.rgb[2],
+      curveRGB3: c.rgb[3],
+      curveRGB4: c.rgb[4],
+      curveR0: c.r[0],
+      curveR1: c.r[1],
+      curveR2: c.r[2],
+      curveR3: c.r[3],
+      curveR4: c.r[4],
+      curveG0: c.g[0],
+      curveG1: c.g[1],
+      curveG2: c.g[2],
+      curveG3: c.g[3],
+      curveG4: c.g[4],
+      curveB0: c.b[0],
+      curveB1: c.b[1],
+      curveB2: c.b[2],
+      curveB3: c.b[3],
+      curveB4: c.b[4],
+    };
+  };
 
   const editedUniforms = buildUniformObj(activeParams, showClipping && !showOriginal);
   const rawUniforms = buildUniformObj(originalPreset.params, false);
@@ -856,9 +971,6 @@ function AstroEditorScreen() {
     return Math.max(effW / cropRect.w, effH / cropRect.h) * fineFillScale;
   }, [skImage, quarterTurns, cropRect, fineFillScale]);
 
-  const histW = 112;
-  const histH = 48;
-
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
       <StatusBar style="light" backgroundColor="#070A12" />
@@ -868,7 +980,7 @@ function AstroEditorScreen() {
         <View style={styles.header}>
           <View style={{ flex: 1, paddingRight: 8 }}>
             <Text style={styles.title}>AstroEnhancer</Text>
-            <Text style={styles.subtitle}>DBE • SCNR • Wavelets • Deep-Sky & Planetary</Text>
+            <Text style={styles.subtitle}>DBE • SCNR • Wavelets • Color Curves</Text>
           </View>
           <Pressable style={styles.primaryBtn} onPress={pickImage}>
             <Text style={styles.primaryBtnText}>{imageUri ? 'Change Photo' : 'Open Photo'}</Text>
@@ -885,7 +997,7 @@ function AstroEditorScreen() {
                   { width: canvasDimensions.width, height: canvasDimensions.height },
                 ]}
               >
-                {/* Processed (Right side in Split mode, Full in Normal mode) */}
+                {/* Processed Layer */}
                 <View
                   style={{
                     width: canvasDimensions.width,
@@ -964,7 +1076,7 @@ function AstroEditorScreen() {
                   </View>
                 )}
 
-                {/* Draggable Split Wipe Handle (Wide 52px Touch Target) */}
+                {/* Draggable Split Wipe Handle */}
                 {splitEnabled && (
                   <View
                     {...splitPanResponder.panHandlers}
@@ -980,23 +1092,42 @@ function AstroEditorScreen() {
                   </View>
                 )}
 
-                {/* Live Skia RGB Curve Histogram HUD */}
-                {showHistogram && histData && (
+                {/* Always-Reliable Live RGB Histogram HUD */}
+                {showHistogram && (
                   <View pointerEvents="none" style={styles.histBox}>
-                    <Canvas style={{ width: histW, height: histH }}>
-                      <Path
-                        path={buildCurvePath(histData.b, histW, histH)}
-                        color="rgba(56, 189, 248, 0.45)"
-                      />
-                      <Path
-                        path={buildCurvePath(histData.g, histW, histH)}
-                        color="rgba(74, 222, 128, 0.45)"
-                      />
-                      <Path
-                        path={buildCurvePath(histData.r, histW, histH)}
-                        color="rgba(248, 113, 113, 0.45)"
-                      />
-                    </Canvas>
+                    <View style={styles.histBars}>
+                      {histData.r.map((_, i) => (
+                        <View key={i} style={styles.histCol}>
+                          <View
+                            style={[
+                              styles.histBar,
+                              {
+                                height: Math.max(2, histData.b[i] * 46),
+                                backgroundColor: 'rgba(56, 189, 248, 0.72)',
+                              },
+                            ]}
+                          />
+                          <View
+                            style={[
+                              styles.histBar,
+                              {
+                                height: Math.max(2, histData.g[i] * 46),
+                                backgroundColor: 'rgba(74, 222, 128, 0.62)',
+                              },
+                            ]}
+                          />
+                          <View
+                            style={[
+                              styles.histBar,
+                              {
+                                height: Math.max(2, histData.r[i] * 46),
+                                backgroundColor: 'rgba(248, 113, 113, 0.62)',
+                              },
+                            ]}
+                          />
+                        </View>
+                      ))}
+                    </View>
                     <Text style={styles.histLabel}>RGB HISTOGRAM</Text>
                   </View>
                 )}
@@ -1060,14 +1191,14 @@ function AstroEditorScreen() {
             <Pressable style={styles.emptyState} onPress={pickImage}>
               <Text style={styles.emptyTitle}>Tap to Load Astrophoto</Text>
               <Text style={styles.emptyDesc}>
-                Dynamic Background Extraction • Green Cast SCNR • Multi-Scale Wavelets • Crop & Rotate
+                Dynamic Background Extraction • Color Curves • SCNR • Wavelets • Crop & Rotate
               </Text>
             </Pressable>
           )}
         </View>
       </View>
 
-      {/* MIDDLE SCROLLABLE AREA WITH TABS */}
+      {/* MIDDLE SCROLLABLE AREA WITH 4 TABS */}
       {skImage ? (
         <>
           <View style={styles.tabBar}>
@@ -1076,7 +1207,15 @@ function AstroEditorScreen() {
               onPress={() => setActiveTab('tune')}
             >
               <Text style={[styles.tabText, activeTab === 'tune' && styles.tabTextActive]}>
-                Astro Pipeline
+                Pipeline
+              </Text>
+            </Pressable>
+            <Pressable
+              style={[styles.tabBtn, activeTab === 'curves' && styles.tabBtnActive]}
+              onPress={() => setActiveTab('curves')}
+            >
+              <Text style={[styles.tabText, activeTab === 'curves' && styles.tabTextActive]}>
+                Curves
               </Text>
             </Pressable>
             <Pressable
@@ -1092,7 +1231,7 @@ function AstroEditorScreen() {
               onPress={() => setActiveTab('crop')}
             >
               <Text style={[styles.tabText, activeTab === 'crop' && styles.tabTextActive]}>
-                Crop & Rotate
+                Crop
               </Text>
             </Pressable>
           </View>
@@ -1102,6 +1241,17 @@ function AstroEditorScreen() {
             contentContainerStyle={styles.middleScrollContent}
             scrollEnabled={!isDraggingControl}
           >
+            {activeTab === 'curves' && (
+              <CurveEditorCard
+                curves={params.curves || DEFAULT_CURVES}
+                activeChannel={activeCurveChannel}
+                onSelectChannel={setActiveCurveChannel}
+                onChangePoint={(idx, val) => updateCurvePoint(activeCurveChannel, idx, val)}
+                onResetChannel={() => resetCurveChannel(activeCurveChannel)}
+                onDragStateChange={setIsDraggingControl}
+              />
+            )}
+
             {activeTab === 'presets' && (
               <>
                 <View style={styles.presetHeaderRow}>
@@ -1348,7 +1498,7 @@ function AstroEditorScreen() {
           <View style={styles.modalCard}>
             <Text style={styles.modalTitle}>Save Custom Preset</Text>
             <Text style={styles.modalSub}>
-              Save your current slider settings for future astrophotos.
+              Save your current slider & curve settings for future astrophotos.
             </Text>
             <TextInput
               style={styles.modalInput}
@@ -1372,6 +1522,199 @@ function AstroEditorScreen() {
           </View>
         </View>
       </Modal>
+    </View>
+  );
+}
+
+// Interactive 5-Point Tone Curve Editor Component
+function CurveEditorCard({
+  curves,
+  activeChannel,
+  onSelectChannel,
+  onChangePoint,
+  onResetChannel,
+  onDragStateChange,
+}: {
+  curves: CurvePoints;
+  activeChannel: CurveChannel;
+  onSelectChannel: (ch: CurveChannel) => void;
+  onChangePoint: (index: number, val: number) => void;
+  onResetChannel: () => void;
+  onDragStateChange: (dragging: boolean) => void;
+}) {
+  const pts = curves[activeChannel];
+  const boxWidthRef = useRef(280);
+  const boxHeight = 170;
+  const activeIdxRef = useRef<number>(2);
+
+  const channelColor =
+    activeChannel === 'r'
+      ? '#F87171'
+      : activeChannel === 'g'
+      ? '#4ADE80'
+      : activeChannel === 'b'
+      ? '#38BDF8'
+      : '#F8FAFC';
+
+  const onChangePointRef = useRef(onChangePoint);
+  const onDragRef = useRef(onDragStateChange);
+  onChangePointRef.current = onChangePoint;
+  onDragRef.current = onDragStateChange;
+
+  const curvePanResponder = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onStartShouldSetPanResponderCapture: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponderCapture: () => true,
+      onPanResponderTerminationRequest: () => false,
+      onPanResponderGrant: (evt) => {
+        onDragRef.current(true);
+        const w = Math.max(1, boxWidthRef.current);
+        const xRatio = Math.min(1, Math.max(0, evt.nativeEvent.locationX / w));
+        // Snap selection to nearest of the 5 control points (0, 0.25, 0.5, 0.75, 1.0)
+        const nearestIdx = Math.min(4, Math.max(0, Math.round(xRatio * 4)));
+        activeIdxRef.current = nearestIdx;
+        const yVal = 1 - Math.min(1, Math.max(0, evt.nativeEvent.locationY / boxHeight));
+        onChangePointRef.current(nearestIdx, yVal);
+      },
+      onPanResponderMove: (evt) => {
+        const yVal = 1 - Math.min(1, Math.max(0, evt.nativeEvent.locationY / boxHeight));
+        onChangePointRef.current(activeIdxRef.current, yVal);
+      },
+      onPanResponderRelease: () => {
+        onDragRef.current(false);
+      },
+      onPanResponderTerminate: () => {
+        onDragRef.current(false);
+      },
+    })
+  ).current;
+
+  const pointLabels = ['Black', 'Shadows', 'Midtones', 'Highlights', 'White'];
+
+  // Sample 25 points along the interpolated curve to draw a smooth polyline
+  const curveSegments = useMemo(() => {
+    const samples: { xPct: number; yPct: number }[] = [];
+    for (let i = 0; i <= 24; i++) {
+      const x = i / 24;
+      const y = evalSpline5JS(x, pts);
+      samples.push({ xPct: x * 100, yPct: (1 - y) * 100 });
+    }
+    return samples;
+  }, [pts]);
+
+  return (
+    <View style={styles.controlsCard}>
+      {/* Channel Selector + Reset */}
+      <View style={styles.curveTopBar}>
+        <View style={styles.curveChannelGroup}>
+          {(
+            [
+              { id: 'rgb', label: 'RGB', color: '#F8FAFC' },
+              { id: 'r', label: 'Red', color: '#F87171' },
+              { id: 'g', label: 'Green', color: '#4ADE80' },
+              { id: 'b', label: 'Blue', color: '#38BDF8' },
+            ] as { id: CurveChannel; label: string; color: string }[]
+          ).map((ch) => {
+            const selected = activeChannel === ch.id;
+            return (
+              <Pressable
+                key={ch.id}
+                style={[
+                  styles.channelPill,
+                  selected && { borderColor: ch.color, backgroundColor: '#1E293B' },
+                ]}
+                onPress={() => onSelectChannel(ch.id)}
+              >
+                <Text style={[styles.channelPillText, { color: ch.color }]}>{ch.label}</Text>
+              </Pressable>
+            );
+          })}
+        </View>
+
+        <Pressable style={styles.resetCurveBtn} onPress={onResetChannel}>
+          <Text style={styles.resetCurveText}>Reset</Text>
+        </Pressable>
+      </View>
+
+      {/* Interactive 2D Tone Curve Box */}
+      <View
+        pointerEvents="box-only"
+        onLayout={(e) => {
+          boxWidthRef.current = e.nativeEvent.layout.width;
+        }}
+        style={[styles.curveBox, { height: boxHeight }]}
+        {...curvePanResponder.panHandlers}
+      >
+        {/* 4x4 Grid Lines */}
+        {[25, 50, 75].map((pct) => (
+          <React.Fragment key={pct}>
+            <View style={[styles.gridLineV, { left: `${pct}%` }]} />
+            <View style={[styles.gridLineH, { top: `${pct}%` }]} />
+          </React.Fragment>
+        ))}
+
+        {/* Diagonal Linear Reference Line */}
+        {Array.from({ length: 20 }).map((_, idx) => (
+          <View
+            key={`diag-${idx}`}
+            style={{
+              position: 'absolute',
+              left: `${(idx / 19) * 100}%`,
+              top: `${(1 - idx / 19) * 100}%`,
+              width: 3,
+              height: 1.5,
+              backgroundColor: 'rgba(148, 163, 184, 0.25)',
+            }}
+          />
+        ))}
+
+        {/* Smooth Curve Dots/Line */}
+        {curveSegments.map((pt, idx) => (
+          <View
+            key={`seg-${idx}`}
+            style={{
+              position: 'absolute',
+              left: `${pt.xPct}%`,
+              top: `${pt.yPct}%`,
+              width: 5,
+              height: 5,
+              borderRadius: 2.5,
+              marginLeft: -2.5,
+              marginTop: -2.5,
+              backgroundColor: channelColor,
+            }}
+          />
+        ))}
+
+        {/* 5 Draggable Control Handles */}
+        {pts.map((val, idx) => (
+          <View
+            key={`node-${idx}`}
+            style={[
+              styles.curveHandle,
+              {
+                left: `${idx * 25}%`,
+                top: `${(1 - val) * 100}%`,
+                borderColor: channelColor,
+              },
+            ]}
+          />
+        ))}
+      </View>
+
+      {/* Numeric Readouts for the 5 Points */}
+      <View style={styles.curveReadoutRow}>
+        {pts.map((val, idx) => (
+          <View key={idx} style={styles.curveReadoutItem}>
+            <Text style={styles.curveReadoutLabel}>{pointLabels[idx]}</Text>
+            <Text style={[styles.curveReadoutVal, { color: channelColor }]}>
+              {Math.round(val * 100)}%
+            </Text>
+          </View>
+        ))}
+      </View>
     </View>
   );
 }
@@ -1557,12 +1900,30 @@ const styles = StyleSheet.create({
     position: 'absolute',
     top: 8,
     right: 8,
-    backgroundColor: 'rgba(7, 10, 18, 0.88)',
-    borderColor: '#334155',
+    backgroundColor: 'rgba(7, 10, 18, 0.90)',
+    borderColor: '#38BDF8',
     borderWidth: 1,
     borderRadius: 8,
     padding: 6,
-    zIndex: 10,
+    zIndex: 30,
+  },
+  histBars: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    height: 46,
+    gap: 1.5,
+  },
+  histCol: {
+    width: 3,
+    height: 46,
+    justifyContent: 'flex-end',
+  },
+  histBar: {
+    position: 'absolute',
+    bottom: 0,
+    width: 3,
+    borderTopLeftRadius: 1,
+    borderTopRightRadius: 1,
   },
   histLabel: {
     color: '#CBD5E1',
@@ -1624,7 +1985,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#0B111E',
     borderBottomWidth: 1,
     borderBottomColor: '#1E293B',
-    paddingHorizontal: 12,
+    paddingHorizontal: 8,
   },
   tabBtn: {
     flex: 1,
@@ -1638,7 +1999,7 @@ const styles = StyleSheet.create({
   },
   tabText: {
     color: '#94A3B8',
-    fontSize: 13,
+    fontSize: 12,
     fontWeight: '600',
   },
   tabTextActive: {
@@ -1714,13 +2075,96 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#1E293B',
     paddingHorizontal: 14,
-    paddingVertical: 6,
+    paddingVertical: 10,
+  },
+  curveTopBar: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  curveChannelGroup: {
+    flexDirection: 'row',
+    gap: 6,
+  },
+  channelPill: {
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 6,
+    backgroundColor: '#070A12',
+    borderWidth: 1,
+    borderColor: '#1E293B',
+  },
+  channelPillText: {
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  resetCurveBtn: {
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 6,
+    backgroundColor: '#1E293B',
+  },
+  resetCurveText: {
+    color: '#CBD5E1',
+    fontSize: 11,
+    fontWeight: '600',
+  },
+  curveBox: {
+    width: '100%',
+    backgroundColor: '#050811',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#334155',
+    position: 'relative',
+    overflow: 'hidden',
+  },
+  gridLineV: {
+    position: 'absolute',
+    top: 0,
+    bottom: 0,
+    width: 1,
+    backgroundColor: 'rgba(51, 65, 85, 0.45)',
+  },
+  gridLineH: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    height: 1,
+    backgroundColor: 'rgba(51, 65, 85, 0.45)',
+  },
+  curveHandle: {
+    position: 'absolute',
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+    backgroundColor: '#070A12',
+    borderWidth: 2.5,
+    marginLeft: -8,
+    marginTop: -8,
+  },
+  curveReadoutRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 10,
+  },
+  curveReadoutItem: {
+    alignItems: 'center',
+  },
+  curveReadoutLabel: {
+    color: '#64748B',
+    fontSize: 10,
+  },
+  curveReadoutVal: {
+    fontSize: 11,
+    fontWeight: '700',
+    marginTop: 1,
   },
   cropSectionLabel: {
     color: '#94A3B8',
     fontSize: 12,
     fontWeight: '600',
-    marginTop: 6,
+    marginTop: 2,
     marginBottom: 8,
   },
   aspectRow: {
