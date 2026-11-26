@@ -61,11 +61,16 @@ interface ImageAnalysis {
   rawPixels: Uint8Array | null;
 }
 
-const CUSTOM_PRESETS_FILE = new File(Paths.document, 'astro_custom_presets.json');
+function getCustomPresetsFile(): File | null {
+  try {
+    return new File(Paths.document, 'astro_custom_presets.json');
+  } catch {
+    return null;
+  }
+}
 
 function sampleDownscaledRGBA(img: SkImage, size = 64): Uint8Array | null {
   try {
-    // Try CPU raster surface first for 100% reliable readPixels on all Android GPUs, then GPU offscreen
     const surface = Skia.Surface.Make(size, size) || Skia.Surface.MakeOffscreen(size, size);
     if (!surface) return null;
 
@@ -325,7 +330,6 @@ function analyzeAstroImage(img: SkImage): ImageAnalysis {
       };
     }
 
-    // Stronger, punchy Auto Pro deep-sky calibration
     const autoStretch = Math.min(0.84, Math.max(0.45, Number((0.88 - p50 * 1.45).toFixed(2))));
     const autoBlack = Math.min(0.24, Math.max(0.03, Number((p08 * 0.92).toFixed(2))));
 
@@ -418,11 +422,11 @@ function AstroEditorScreen() {
 
   useEffect(() => {
     try {
-      if (CUSTOM_PRESETS_FILE.exists) {
-        const text = CUSTOM_PRESETS_FILE.textSync();
+      const file = getCustomPresetsFile();
+      if (file && file.exists) {
+        const text = file.textSync();
         const parsed = JSON.parse(text);
         if (Array.isArray(parsed)) {
-          // Ensure older saved presets have default curves
           const migrated = parsed.map((p: AstroPreset) => ({
             ...p,
             params: {
@@ -435,14 +439,17 @@ function AstroEditorScreen() {
         }
       }
     } catch {
-      // Ignore corrupt preset file
+      // Ignore corrupt or unavailable preset file
     }
   }, []);
 
   const persistCustomPresets = (updated: AstroPreset[]) => {
     setCustomPresets(updated);
     try {
-      CUSTOM_PRESETS_FILE.write(JSON.stringify(updated));
+      const file = getCustomPresetsFile();
+      if (file) {
+        file.write(JSON.stringify(updated));
+      }
     } catch {
       // Ignore write error
     }
@@ -1092,7 +1099,7 @@ function AstroEditorScreen() {
                   </View>
                 )}
 
-                {/* Always-Reliable Live RGB Histogram HUD */}
+                {/* Live RGB Histogram HUD */}
                 {showHistogram && (
                   <View pointerEvents="none" style={styles.histBox}>
                     <View style={styles.histBars}>
@@ -1526,7 +1533,6 @@ function AstroEditorScreen() {
   );
 }
 
-// Interactive 5-Point Tone Curve Editor Component
 function CurveEditorCard({
   curves,
   activeChannel,
@@ -1572,7 +1578,6 @@ function CurveEditorCard({
         onDragRef.current(true);
         const w = Math.max(1, boxWidthRef.current);
         const xRatio = Math.min(1, Math.max(0, evt.nativeEvent.locationX / w));
-        // Snap selection to nearest of the 5 control points (0, 0.25, 0.5, 0.75, 1.0)
         const nearestIdx = Math.min(4, Math.max(0, Math.round(xRatio * 4)));
         activeIdxRef.current = nearestIdx;
         const yVal = 1 - Math.min(1, Math.max(0, evt.nativeEvent.locationY / boxHeight));
@@ -1593,7 +1598,6 @@ function CurveEditorCard({
 
   const pointLabels = ['Black', 'Shadows', 'Midtones', 'Highlights', 'White'];
 
-  // Sample 25 points along the interpolated curve to draw a smooth polyline
   const curveSegments = useMemo(() => {
     const samples: { xPct: number; yPct: number }[] = [];
     for (let i = 0; i <= 24; i++) {
@@ -1606,7 +1610,6 @@ function CurveEditorCard({
 
   return (
     <View style={styles.controlsCard}>
-      {/* Channel Selector + Reset */}
       <View style={styles.curveTopBar}>
         <View style={styles.curveChannelGroup}>
           {(
@@ -1638,7 +1641,6 @@ function CurveEditorCard({
         </Pressable>
       </View>
 
-      {/* Interactive 2D Tone Curve Box */}
       <View
         pointerEvents="box-only"
         onLayout={(e) => {
@@ -1647,7 +1649,6 @@ function CurveEditorCard({
         style={[styles.curveBox, { height: boxHeight }]}
         {...curvePanResponder.panHandlers}
       >
-        {/* 4x4 Grid Lines */}
         {[25, 50, 75].map((pct) => (
           <React.Fragment key={pct}>
             <View style={[styles.gridLineV, { left: `${pct}%` }]} />
@@ -1655,7 +1656,6 @@ function CurveEditorCard({
           </React.Fragment>
         ))}
 
-        {/* Diagonal Linear Reference Line */}
         {Array.from({ length: 20 }).map((_, idx) => (
           <View
             key={`diag-${idx}`}
@@ -1670,7 +1670,6 @@ function CurveEditorCard({
           />
         ))}
 
-        {/* Smooth Curve Dots/Line */}
         {curveSegments.map((pt, idx) => (
           <View
             key={`seg-${idx}`}
@@ -1688,7 +1687,6 @@ function CurveEditorCard({
           />
         ))}
 
-        {/* 5 Draggable Control Handles */}
         {pts.map((val, idx) => (
           <View
             key={`node-${idx}`}
@@ -1704,7 +1702,6 @@ function CurveEditorCard({
         ))}
       </View>
 
-      {/* Numeric Readouts for the 5 Points */}
       <View style={styles.curveReadoutRow}>
         {pts.map((val, idx) => (
           <View key={idx} style={styles.curveReadoutItem}>
