@@ -99,14 +99,14 @@ jobs:
       - name: Generate Native Android Project
         run: npx expo prebuild --platform android --non-interactive
 
-      - name: Configure Release Signing, R8 Shrinking & Conditional ABI Splits
+      - name: Configure Release Signing & Conditional ABI Splits
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
         run: |
           echo "$KEYSTORE_B64" | base64 --decode > android/app/release.keystore
 
-          printf "\nMYAPP_UPLOAD_STORE_FILE=release.keystore\nMYAPP_UPLOAD_KEY_ALIAS=astrokey\nMYAPP_UPLOAD_STORE_PASSWORD=%s\nMYAPP_UPLOAD_KEY_PASSWORD=%s\nandroid.enableMinifyInReleaseBuilds=true\nandroid.enableShrinkResourcesInReleaseBuilds=true\n" "$KEYSTORE_PASS" "$KEYSTORE_PASS" >> android/gradle.properties
+          printf "\nMYAPP_UPLOAD_STORE_FILE=release.keystore\nMYAPP_UPLOAD_KEY_ALIAS=astrokey\nMYAPP_UPLOAD_STORE_PASSWORD=%s\nMYAPP_UPLOAD_KEY_PASSWORD=%s\n" "$KEYSTORE_PASS" "$KEYSTORE_PASS" >> android/gradle.properties
 
           node -e '
           const fs = require("fs");
