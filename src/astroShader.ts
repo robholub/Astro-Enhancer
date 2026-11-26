@@ -20,6 +20,20 @@ export const DEFAULT_CURVES: CurvePoints = {
   b: [0.0, 0.25, 0.5, 0.75, 1.0],
 };
 
+export interface BgCornerModel {
+  tl: [number, number, number];
+  tr: [number, number, number];
+  bl: [number, number, number];
+  br: [number, number, number];
+}
+
+export const DEFAULT_BG_MODEL: BgCornerModel = {
+  tl: [0, 0, 0],
+  tr: [0, 0, 0],
+  bl: [0, 0, 0],
+  br: [0, 0, 0],
+};
+
 export interface AstroParams {
   stretch: number;        // 0.0 to 1.0 (Asinh midtone stretch)
   blackPoint: number;     // 0.0 to 0.35 (Sky background floor)
