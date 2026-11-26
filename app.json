@@ -2,7 +2,7 @@
   "expo": {
     "name": "AstroEnhancer",
     "slug": "astro-enhancer",
-    "version": "1.0.2",
+    "version": "1.0.3",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
     "icon": "./assets/icon.png",
@@ -28,7 +28,7 @@
     },
     "android": {
       "package": "com.robholub.astroenhancer",
-      "versionCode": 3,
+      "versionCode": 4,
       "minSdkVersion": 26,
       "adaptiveIcon": {
         "foregroundImage": "./assets/icon.png",
